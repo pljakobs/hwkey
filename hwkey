@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+import os
+import sys
+import yaml
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Optional, List, Dict
+
+import typer
+import paramiko
+from rich.console import Console
+from rich.table import Table
+from fido2.hid import CtapHidDevice
+
+app = typer.Typer(help="Hardware SSH Key Ledger & Remote Manager")
+console = Console()
+
+REPO_DIR = Path.home() / ".hwkey" / "repo"
+LEDGER_PATH = REPO_DIR / "ledger.enc.yaml"
+
+ENV_PATH = f"{Path.home()}/go/bin:{Path.home()}/.local/bin:{os.environ.get('PATH', '')}"
+
+# ----------------------------------------------------------------------
+# Encrypted Git Ledger Engine
+# ----------------------------------------------------------------------
+
+class GitEncryptedLedger:
+    """Handles SOPS encryption/decryption in-memory and Git sync."""
+
+    def __init__(self, repo_dir: Path, ledger_path: Path):
+        self.repo_dir = repo_dir
+        self.ledger_path = ledger_path
+
+    @staticmethod
+    def _get_env() -> dict:
+        env = os.environ.copy()
+        env["PATH"] = ENV_PATH
+        return env
+
+    def _run_cmd(self, cmd: list, cwd: Optional[Path] = None, capture: bool = True) -> str:
+        res = subprocess.run(
+            cmd,
+            cwd=cwd or self.repo_dir,
+            capture_output=capture,
+            text=True,
+            env=self._get_env()
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"Command {' '.join(cmd)} failed: {res.stderr.strip()}")
+        return res.stdout
+
+    def sync_pull(self):
+        """Pulls latest encrypted ledger state from remote Git repo if available."""
+        if (self.repo_dir / ".git").exists():
+            try:
+                check_remote = subprocess.run(
+                    ["git", "ls-remote", "--heads", "origin", "main"],
+                    cwd=self.repo_dir, capture_output=True, text=True, env=self._get_env()
+                )
+                if check_remote.returncode == 0 and not check_remote.stdout.strip():
+                    console.print("[dim cyan]Remote repository is empty. Creating initial commit...[/dim cyan]")
+                    self._run_cmd(["git", "checkout", "-b", "main"])
+                    self._run_cmd(["git", "commit", "--allow-empty", "-m", "Initial commit"])
+                    self._run_cmd(["git", "push", "-u", "origin", "main"])
+
+                self._run_cmd(["git", "pull", "--rebase", "origin", "main"])
+            except Exception as e:
+                console.print(f"[dim yellow]Notice: Git pull skipped/failed: {e}[/dim yellow]")
+
+    def load(self) -> dict:
+        """Decrypts the ledger using SOPS directly into memory."""
+        self.sync_pull()
+        
+        if not self.ledger_path.exists():
+            return {"keys": {}, "hosts": {}}
+
+        try:
+            decrypted_yaml = self._run_cmd(["sops", "-d", str(self.ledger_path)])
+            return yaml.safe_load(decrypted_yaml) or {"keys": {}, "hosts": {}}
+        except Exception as e:
+            console.print(f"[bold red]SOPS Decryption Error:[bold red] {e}")
+            raise typer.Exit(1)
+
+    def save(self, data: dict, commit_msg: str = "Update hwkey ledger"):
+        """Encrypts updated ledger in memory, writes to disk, commits, and pushes to Git."""
+        self.repo_dir.mkdir(parents=True, exist_ok=True)
+        sops_config = self.repo_dir / ".sops.yaml"
+
+        if not sops_config.exists():
+            console.print("[bold yellow].sops.yaml missing. Initializing environment...[/bold yellow]")
+            ensure_sops_config()
+
+        raw_yaml = yaml.dump(data, default_flow_style=False)
+
+        # FIXED: Changed --filename-override to ledger.enc.yaml to match path_regex
+        process = subprocess.Popen(
+            ["sops", "--encrypt", "--filename-override", "ledger.enc.yaml", "/dev/stdin"],
+            cwd=self.repo_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._get_env()
+        )
+        encrypted_out, err = process.communicate(input=raw_yaml)
+
+        if process.returncode != 0:
+            console.print(f"[bold red]SOPS Encryption Error:[bold red] {err.strip()}")
+            raise typer.Exit(1)
+
+        with open(self.ledger_path, "w") as f:
+            f.write(encrypted_out)
+
+        if (self.repo_dir / ".git").exists():
+            try:
+                self._run_cmd(["git", "add", str(self.ledger_path)])
+                self._run_cmd(["git", "add", ".sops.yaml"])
+                self._run_cmd(["git", "commit", "-m", commit_msg])
+                self._run_cmd(["git", "push", "origin", "main"])
+                console.print("[dim green]Synced changes with remote Git repo.[/dim green]")
+            except Exception as e:
+                console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
+
+ledger_mgr = GitEncryptedLedger(REPO_DIR, LEDGER_PATH)
+
+def load_ledger() -> dict:
+    return ledger_mgr.load()
+
+def save_ledger(data: dict, action: str = "Update hwkey ledger"):
+    ledger_mgr.save(data, commit_msg=action)
+
+# ----------------------------------------------------------------------
+# Setup Helpers & Maintenance Commands
+# ----------------------------------------------------------------------
+
+def ensure_sops_config() -> List[str]:
+    """Ensures a local Age key exists and writes a valid .sops.yaml file."""
+    age_dir = Path.home() / ".config" / "sops" / "age"
+    age_dir.mkdir(parents=True, exist_ok=True)
+    key_file = age_dir / "keys.txt"
+    recipients: List[str] = []
+
+    if key_file.exists():
+        with open(key_file, "r") as f:
+            for line in f:
+                if line.startswith("# public key:"):
+                    pub = line.split(":")[-1].strip()
+                    recipients.append(pub)
+                    break
+
+    if not recipients:
+        console.print("[bold cyan]Generating local Age encryption key...[/bold cyan]")
+        try:
+            res = subprocess.run(
+                ["age-keygen", "-o", str(key_file)],
+                capture_output=True, text=True, check=True,
+                env={"PATH": ENV_PATH}
+            )
+            for line in res.stderr.splitlines():
+                if "Public key:" in line:
+                    pub = line.split(":")[-1].strip()
+                    recipients.append(pub)
+                    console.print(f"[bold green]✔ Generated software Age key: {pub}[/bold green]")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            console.print("[bold red]Error: 'age-keygen' tool not found. Run ./install.sh first.[/bold red]")
+            raise typer.Exit(1)
+
+    age_list_formatted = "\n".join([f"      - {r}" for r in recipients])
+    sops_content = f"creation_rules:\n  - path_regex: ledger\\.enc\\.yaml$\n    age:\n{age_list_formatted}\n"
+
+    sops_config = REPO_DIR / ".sops.yaml"
+    REPO_DIR.mkdir(parents=True, exist_ok=True)
+    with open(sops_config, "w") as f:
+        f.write(sops_content)
+
+    return recipients
+
+@app.command()
+def init(
+    git_url: Optional[str] = typer.Option(None, "--git-url", "-g", help="Remote Git repository URL")
+):
+    """Initialize the local ledger repository, provision Age keys, and configure SOPS encryption."""
+    recipients = ensure_sops_config()
+
+    if typer.confirm("Would you like to add a SECOND Age public key recipient for backup?", default=False):
+        backup_pub = typer.prompt("Enter backup Age public key (starts with age1...)").strip()
+        recipients.append(backup_pub)
+        
+        age_list_formatted = "\n".join([f"      - {r}" for r in recipients])
+        sops_content = f"creation_rules:\n  - path_regex: ledger\\.enc\\.yaml$\n    age:\n{age_list_formatted}\n"
+        with open(REPO_DIR / ".sops.yaml", "w") as f:
+            f.write(sops_content)
+
+    if not (REPO_DIR / ".git").exists():
+        subprocess.run(["git", "init", "-b", "main"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+        console.print("[bold green]✔ Initialized local Git repository.[/bold green]")
+
+    console.print(f"[bold green]✔ Configured SOPS encryption with {len(recipients)} recipient key(s).[/bold green]")
+
+    if git_url:
+        set_remote(git_url)
+
+@app.command("set-remote")
+def set_remote(
+    git_url: str = typer.Argument(..., help="Remote Git URL (e.g. git@github.com:user/hwkey-ledger.git)")
+):
+    """Configure or update the remote Git repository URL."""
+    if not (REPO_DIR / ".git").exists():
+        subprocess.run(["git", "init", "-b", "main"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+
+    res = subprocess.run(["git", "remote", "get-url", "origin"], cwd=REPO_DIR, capture_output=True, text=True, env={"PATH": ENV_PATH})
+    if res.returncode == 0:
+        subprocess.run(["git", "remote", "set-url", "origin", git_url], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+    else:
+        subprocess.run(["git", "remote", "add", "origin", git_url], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+
+    console.print(f"[bold green]✔ Git remote 'origin' set to: {git_url}[/bold green]")
+
+# ----------------------------------------------------------------------
+# Device Management
+# ----------------------------------------------------------------------
+
+def get_physical_usb_keys() -> list:
+    """Scans USB HID bus directly for FIDO2 hardware devices safely."""
+    devices = []
+    for dev in CtapHidDevice.list_devices():
+        desc = getattr(dev, "descriptor", dev)
+        product_name = getattr(desc, "product_name", "Security Key")
+
+        vid = getattr(desc, "vid", getattr(dev, "vid", 0))
+        pid = getattr(desc, "pid", getattr(dev, "pid", 0))
+        path = getattr(dev, "path", getattr(desc, "path", "unknown"))
+
+        if any(name.lower() in str(product_name).lower() for name in ["yubikey", "security key"]):
+            devices.append({
+                "product_name": product_name,
+                "vendor_id": hex(vid) if isinstance(vid, int) else str(vid),
+                "product_id": hex(pid) if isinstance(pid, int) else str(pid),
+                "path": str(path)
+            })
+    return devices
+
+def scan_attached_yubikeys() -> list:
+    """Detects connected USB FIDO2 keys and pulls resident keys using OpenSSH."""
+    physical_devs = get_physical_usb_keys()
+    if not physical_devs:
+        console.print("[bold red]No physical FIDO2 USB devices found![/bold red]")
+        return []
+
+    console.print(f"[bold cyan]Found {len(physical_devs)} physical hardware key(s):[/bold cyan]")
+    for dev in physical_devs:
+        console.print(f"  • {dev['product_name']} (VID: {dev['vendor_id']} PID: {dev['product_id']})")
+
+    discovered_keys = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            subprocess.run(
+                ["ssh-keygen", "-K"],
+                cwd=tmpdir,
+                capture_output=True,
+                text=True,
+                check=True,
+                env={"PATH": ENV_PATH}
+            )
+
+            for key_file in Path(tmpdir).glob("*.pub"):
+                with open(key_file, "r") as f:
+                    pubkey_content = f.read().strip()
+                    discovered_keys.append({
+                        "file_name": key_file.name,
+                        "public_key": pubkey_content
+                    })
+
+        except subprocess.CalledProcessError:
+            console.print("[bold yellow]Note:[bold yellow] 'ssh-keygen -K' found no pre-existing resident keys.")
+
+    return discovered_keys
+
+# ----------------------------------------------------------------------
+# SSH Engine (Atomic Remote File Manipulation)
+# ----------------------------------------------------------------------
+
+def update_remote_authorized_keys(
+    host_info: dict, 
+    keys_to_add: List[str], 
+    keys_to_remove: List[str]
+) -> bool:
+    """Connects via Paramiko SFTP and updates ~/.ssh/authorized_keys atomically."""
+    hostname = host_info["hostname"]
+    port = host_info.get("port", 22)
+    user = host_info.get("user", os.getlogin())
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        console.print(f"[bold blue]Connecting to {user}@{hostname}:{port}...[/bold blue]")
+        client.connect(hostname=hostname, port=port, username=user, timeout=10)
+        sftp = client.open_sftp()
+
+        auth_keys_path = ".ssh/authorized_keys"
+        remote_keys = []
+        
+        try:
+            with sftp.open(auth_keys_path, "r") as f:
+                remote_keys = [line.strip() for line in f.readlines() if line.strip()]
+        except FileNotFoundError:
+            try:
+                sftp.mkdir(".ssh")
+            except IOError:
+                pass
+
+        updated_keys = [k for k in remote_keys if k not in keys_to_remove]
+        for k in keys_to_add:
+            if k not in updated_keys:
+                updated_keys.append(k)
+
+        temp_remote = f".ssh/authorized_keys.tmp.{os.urandom(4).hex()}"
+        with sftp.open(temp_remote, "w") as f:
+            f.write("\n".join(updated_keys) + "\n")
+        
+        sftp.chmod(temp_remote, 0o600)
+        sftp.posix_rename(temp_remote, auth_keys_path)
+        
+        sftp.close()
+        client.close()
+        console.print(f"[bold green]✔ Successfully updated keys on {hostname}[/bold green]")
+        return True
+
+    except Exception as e:
+        console.print(f"[bold red]✖ Failed on {hostname}: {e}[/bold red]")
+        return False
+
+# ----------------------------------------------------------------------
+# CLI Commands
+# ----------------------------------------------------------------------
+
+@app.command()
+def enroll(
+    key_id: str = typer.Argument(..., help="Identifier for the YubiKey (e.g. yubi_primary)"),
+    pubkey: str = typer.Argument(..., help="The public key string")
+):
+    """Enroll a new hardware key into the ledger."""
+    ledger = load_ledger()
+    ledger["keys"][key_id] = {"public_key": pubkey.strip()}
+    save_ledger(ledger, action=f"Enroll key {key_id}")
+    console.print(f"[bold green]Enrolled hardware key '{key_id}' into encrypted ledger.[/bold green]")
+
+@app.command()
+def register(
+    hostname: str = typer.Argument(..., help="IP or FQDN of host"),
+    alias: Optional[str] = typer.Option(None, "--alias", "-a", help="Optional alias for the host"),
+    user: str = typer.Option(os.getlogin(), "--user", "-u", help="Remote SSH user"),
+    port: int = typer.Option(22, "--port", "-p", help="SSH port")
+):
+    """Register a target server and deploy all ledger keys to it."""
+    ledger = load_ledger()
+    if not ledger.get("keys"):
+        console.print("[bold red]No keys enrolled in ledger yet! Run 'hwkey scan' or 'hwkey enroll' first.[/bold red]")
+        raise typer.Exit(1)
+
+    host_alias = alias if alias else hostname
+    host_info = {"hostname": hostname, "user": user, "port": port}
+    keys_to_deploy = [k_info["public_key"] for k_info in ledger["keys"].values()]
+
+    success = update_remote_authorized_keys(host_info, keys_to_add=keys_to_deploy, keys_to_remove=[])
+    
+    if success:
+        ledger["hosts"][host_alias] = {
+            **host_info,
+            "deployed_keys": list(ledger["keys"].keys())
+        }
+        save_ledger(ledger, action=f"Register host {host_alias}")
+
+@app.command("show-keys")
+def show_keys():
+    """Show keys known to the ledger and where they are deployed."""
+    ledger = load_ledger()
+    table = Table(title="Encrypted Hardware Key Ledger")
+    table.add_column("Key Alias", style="cyan")
+    table.add_column("Public Key Excerpt", style="magenta")
+    table.add_column("Deployed Hosts", style="green")
+
+    for key_id, data in ledger.get("keys", {}).items():
+        pub = data["public_key"]
+        excerpt = f"{pub[:20]}...{pub[-15:]}" if len(pub) > 35 else pub
+        hosts = [h for h, h_data in ledger.get("hosts", {}).items() if key_id in h_data.get("deployed_keys", [])]
+        table.add_row(key_id, excerpt, ", ".join(hosts) if hosts else "None")
+
+    console.print(table)
+
+@app.command()
+def revoke(key_id: str = typer.Argument(..., help="Key identifier to revoke")):
+    """Revoke a hardware key from all hosts holding it."""
+    ledger = load_ledger()
+    if key_id not in ledger.get("keys", {}):
+        console.print(f"[bold red]Key '{key_id}' not found in ledger.[/bold red]")
+        raise typer.Exit(1)
+
+    target_pubkey = ledger["keys"][key_id]["public_key"]
+
+    for alias, host_info in ledger.get("hosts", {}).items():
+        if key_id in host_info.get("deployed_keys", []):
+            success = update_remote_authorized_keys(host_info, keys_to_add=[], keys_to_remove=[target_pubkey])
+            if success:
+                host_info["deployed_keys"].remove(key_id)
+
+    save_ledger(ledger, action=f"Revoke key {key_id}")
+    console.print(f"[bold green]Revocation completed for '{key_id}'.[/bold green]")
+
+@app.command()
+def rotate(
+    old_key_id: str = typer.Argument(..., help="Key ID being replaced"),
+    new_key_id: str = typer.Argument(..., help="New key ID"),
+    new_pubkey: str = typer.Argument(..., help="New public key string")
+):
+    """Regenerate/replace a key in the ledger and update all servers holding the old key."""
+    ledger = load_ledger()
+    if old_key_id not in ledger.get("keys", {}):
+        console.print(f"[bold red]Key '{old_key_id}' not found.[/bold red]")
+        raise typer.Exit(1)
+
+    old_pubkey = ledger["keys"][old_key_id]["public_key"]
+    ledger["keys"][new_key_id] = {"public_key": new_pubkey.strip()}
+
+    for alias, host_info in ledger.get("hosts", {}).items():
+        if old_key_id in host_info.get("deployed_keys", []):
+            success = update_remote_authorized_keys(
+                host_info, 
+                keys_to_add=[new_pubkey.strip()], 
+                keys_to_remove=[old_pubkey]
+            )
+            if success:
+                host_info["deployed_keys"].remove(old_key_id)
+                host_info["deployed_keys"].append(new_key_id)
+
+    del ledger["keys"][old_key_id]
+    save_ledger(ledger, action=f"Rotate key {old_key_id} to {new_key_id}")
+    console.print(f"[bold green]Rotated '{old_key_id}' to '{new_key_id}'.[/bold green]")
+
+@app.command()
+def remove(key_id: str = typer.Argument(..., help="Key ID to remove and revoke")):
+    """Remove a hardware key storage device and revoke its public key everywhere."""
+    revoke(key_id)
+    ledger = load_ledger()
+    if key_id in ledger.get("keys", {}):
+        del ledger["keys"][key_id]
+        save_ledger(ledger, action=f"Remove key {key_id}")
+    console.print(f"[bold green]Key '{key_id}' removed from ledger completely.[/bold green]")
+
+@app.command()
+def scan():
+    """Scan attached YubiKeys, discover physical devices, and enroll SSH resident keys."""
+    console.print("[bold blue]Scanning USB bus for physical hardware keys...[/bold blue]")
+    keys = scan_attached_yubikeys()
+
+    if not keys:
+        if typer.confirm("Would you like to generate a new resident SSH key on the attached YubiKey?"):
+            alias = typer.prompt("Enter a label for this key (e.g., yubi_primary)")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                key_path = Path(tmpdir) / "id_ed25519_sk"
+                subprocess.run([
+                    "ssh-keygen", "-t", "ed25519-sk",
+                    "-O", "resident",
+                    "-C", alias,
+                    "-f", str(key_path)
+                 ], check=True, env={"PATH": ENV_PATH})
+
+                pubkey_path = Path(str(key_path) + ".pub")
+                with open(pubkey_path, "r") as f:
+                    pubkey = f.read().strip()
+
+            ledger = load_ledger()
+            ledger["keys"][alias] = {"public_key": pubkey}
+            save_ledger(ledger, action=f"Scan & enroll {alias}")
+            console.print(f"[bold green]✔ Successfully generated & enrolled '{alias}'![/bold green]")
+        return
+
+    ledger = load_ledger()
+    for idx, item in enumerate(keys):
+        auto_alias = f"yubi_hardware_{idx+1}"
+        ledger["keys"][auto_alias] = {"public_key": item["public_key"]}
+        console.print(f"[bold green]✔ Enrolled '{auto_alias}' into ledger[/bold green]")
+
+    save_ledger(ledger, action="Scan & enroll attached hardware keys")
+
+if __name__ == "__main__":
+    app()
