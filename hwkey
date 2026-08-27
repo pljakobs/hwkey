@@ -278,6 +278,74 @@ def scan_attached_yubikeys() -> list:
 
     return discovered_keys
 
+@app.command("add-sops-key")
+def add_sops_key(
+    age_pubkey: str = typer.Argument(..., help="New Age recipient public key (starts with age1...)")
+):
+    """Add a new Age recipient public key to SOPS configuration and re-encrypt the ledger."""
+    sops_config = REPO_DIR / ".sops.yaml"
+    if not sops_config.exists():
+        console.print("[bold red]Error: .sops.yaml missing. Run 'hwkey init' first.[/bold red]")
+        raise typer.Exit(1)
+
+    clean_key = age_pubkey.strip()
+    if not clean_key.startswith("age1"):
+        console.print("[bold red]Invalid key format. Age public keys must start with 'age1'.[/bold red]")
+        raise typer.Exit(1)
+
+    with open(sops_config, "r") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    # Extract existing recipient list
+    rules = config_data.get("creation_rules", [{}])[0]
+    existing_age = rules.get("age", [])
+
+    if isinstance(existing_age, str):
+        existing_age = [k.strip() for k in existing_age.split(",") if k.strip()]
+
+    if clean_key in existing_age:
+        console.print(f"[bold yellow]Age key {clean_key[:15]}... is already configured.[/bold yellow]")
+        return
+
+    existing_age.append(clean_key)
+    rules["age"] = existing_age
+    config_data["creation_rules"] = [rules]
+
+    # Save updated .sops.yaml
+    with open(sops_config, "w") as f:
+        yaml.dump(config_data, f, default_flow_style=False)
+
+    console.print(f"[bold green]✔ Added recipient {clean_key[:15]}... to .sops.yaml[/bold green]")
+
+    # Re-encrypt ledger.enc.yaml if it exists
+    if LEDGER_PATH.exists():
+        try:
+            res = subprocess.run(
+                ["sops", "updatekeys", "-y", str(LEDGER_PATH)],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                env={"PATH": ENV_PATH}
+            )
+            if res.returncode != 0:
+                console.print(f"[bold red]SOPS updatekeys failed:[bold red] {res.stderr.strip()}")
+                raise typer.Exit(1)
+
+            console.print("[dim green]✔ Re-encrypted ledger.enc.yaml with updated recipient list.[/dim green]")
+        except Exception as e:
+            console.print(f"[bold red]Failed to update SOPS keys:[bold red] {e}")
+            raise typer.Exit(1)
+
+    # Sync changes to Git
+    if (REPO_DIR / ".git").exists():
+        try:
+            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+            subprocess.run(["git", "commit", "-m", f"Add SOPS recipient {clean_key[:12]}"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+            subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+            console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
+        except Exception as e:
+            console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
+
 # ----------------------------------------------------------------------
 # SSH Engine (Atomic Remote File Manipulation)
 # ----------------------------------------------------------------------

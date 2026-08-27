@@ -32,7 +32,15 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 echo -e "${BOLD}${GREEN}==> Setting up Python virtual environment...${RESET}"
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-"$VENV_DIR/bin/pip" install typer paramiko pyyaml rich fido2 >/dev/null
+
+# Install Python dependencies from requirements.txt if present
+if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+    echo -e "${BOLD}${GREEN}==> Installing dependencies from requirements.txt...${RESET}"
+    "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" >/dev/null
+else
+    echo -e "${BOLD}${YELLOW}==> requirements.txt not found. Installing default inline packages...${RESET}"
+    "$VENV_DIR/bin/pip" install typer paramiko pyyaml rich fido2 >/dev/null
+fi
 
 echo -e "${BOLD}${GREEN}==> Symlinking hwkey executable wrapper to $BIN_DIR/hwkey...${RESET}"
 cat <<EOF > "$BIN_DIR/hwkey"
