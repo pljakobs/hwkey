@@ -65,7 +65,7 @@ class GitEncryptedLedger:
                     self._run_cmd(["git", "commit", "--allow-empty", "-m", "Initial commit"])
                     self._run_cmd(["git", "push", "-u", "origin", "main"])
 
-                self._run_cmd(["git", "pull", "--rebase", "origin", "main"])
+                self._run_cmd(["git", "pull", "--rebase", "--autostash", "origin", "main"])
             except Exception as e:
                 console.print(f"[dim yellow]Notice: Git pull skipped/failed: {e}[/dim yellow]")
 
@@ -314,7 +314,10 @@ def add_sops_key(
     if (REPO_DIR / ".git").exists():
         try:
             env = GitEncryptedLedger._get_env()
-            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "add", ".sops.yaml"], cwd=REPO_DIR, check=True, env=env)
+            if LEDGER_PATH.exists():
+                subprocess.run(["git", "add", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+
             subprocess.run(["git", "commit", "-m", f"Add SOPS recipient {clean_key[:12]}"], cwd=REPO_DIR, check=True, env=env)
             subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env=env)
             console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
@@ -333,7 +336,6 @@ def revoke_sops_key(
 
     clean_key = age_pubkey.strip()
 
-    # Anti-Foot-Gun Protection
     local_pub = get_local_age_pubkey()
     if local_pub and clean_key == local_pub:
         console.print("[bold red]Security Guard triggered: You cannot revoke the active local key for this workstation![/bold red]")
@@ -387,7 +389,10 @@ def revoke_sops_key(
     if (REPO_DIR / ".git").exists():
         try:
             env = GitEncryptedLedger._get_env()
-            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "add", ".sops.yaml"], cwd=REPO_DIR, check=True, env=env)
+            if LEDGER_PATH.exists():
+                subprocess.run(["git", "add", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+
             subprocess.run(["git", "commit", "-m", f"Revoke SOPS recipient {clean_key[:12]}"], cwd=REPO_DIR, check=True, env=env)
             subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env=env)
             console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
@@ -404,7 +409,6 @@ def rotate_sops_key():
 
     console.print(f"[bold cyan]Current local Age key:[bold cyan] {old_local_pub}")
 
-    # 1. Generate new Age key in a temp file
     age_dir = Path.home() / ".config" / "sops" / "age"
     key_file = age_dir / "keys.txt"
     new_key_file = age_dir / "keys.txt.new"
@@ -434,14 +438,11 @@ def rotate_sops_key():
 
     console.print(f"[bold green]✔ Generated new local Age key:[bold green] {new_pubkey}")
 
-    # 2. Add new key to SOPS config while keeping the old key active
     add_sops_key(new_pubkey)
 
-    # 3. Swap local key files so sops uses the new key for future loads
     new_key_file.replace(key_file)
     console.print("[dim green]✔ Activated new key in ~/.config/sops/age/keys.txt[/dim green]")
 
-    # 4. Revoke the old local key safely
     sops_config = REPO_DIR / ".sops.yaml"
     with open(sops_config, "r") as f:
         config_data = yaml.safe_load(f) or {}
@@ -466,7 +467,10 @@ def rotate_sops_key():
 
         if (REPO_DIR / ".git").exists():
             env = GitEncryptedLedger._get_env()
-            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "add", ".sops.yaml"], cwd=REPO_DIR, check=True, env=env)
+            if LEDGER_PATH.exists():
+                subprocess.run(["git", "add", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+
             subprocess.run(["git", "commit", "-m", f"Rotate local SOPS key to {new_pubkey[:12]}"], cwd=REPO_DIR, check=True, env=env)
             subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env=env)
 
@@ -737,6 +741,86 @@ def scan():
         console.print(f"[bold green]✔ Enrolled '{auto_alias}' into ledger[/bold green]")
 
     save_ledger(ledger, action="Scan & enroll attached hardware keys")
+
+@app.command()
+def ssh(
+    target: str = typer.Argument(..., help="Destination host, alias, or user@host (e.g. bigbox or pjakobs@bigbox.fritz.box)"),
+    key: Optional[str] = typer.Option(None, "--key", "-k", "-i", help="Specific key alias from ledger to use"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="SSH port override"),
+    command: Optional[List[str]] = typer.Argument(None, help="Optional remote command to execute")
+):
+    """Connect to a remote target server using an enrolled hardware key."""
+    ledger = load_ledger()
+    hosts = ledger.get("hosts", {})
+
+    user = None
+    hostname = target
+    ssh_port = port
+
+    # 1. Resolve registered alias or hostname metadata
+    if target in hosts:
+        host_info = hosts[target]
+        hostname = host_info["hostname"]
+        user = host_info.get("user")
+        ssh_port = port or host_info.get("port", 22)
+    elif "@" in target:
+        user, hostname = target.split("@", 1)
+
+    destination = f"{user}@{hostname}" if user else hostname
+
+    console.print(f"[bold blue]Connecting to {destination} using YubiKey...[/bold blue]")
+
+    # 2. Extract resident key handles to temporary directory with EMPTY passphrase (-N "")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            subprocess.run(
+                ["ssh-keygen", "-K", "-N", ""],
+                cwd=tmpdir,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=GitEncryptedLedger._get_env()
+            )
+        except subprocess.CalledProcessError:
+            console.print("[bold red]Error: Failed to read resident keys from YubiKey. Is it attached?[/bold red]")
+            raise typer.Exit(1)
+
+        pub_files = list(Path(tmpdir).glob("*.pub"))
+        if not pub_files:
+            console.print("[bold red]No resident SSH keys found on attached hardware token.[/bold red]")
+            raise typer.Exit(1)
+
+        identity_file = pub_files[0].with_suffix("")
+
+        # Match specific key alias if requested via --key / -k / -i
+        if key and key in ledger.get("keys", {}):
+            target_pub = ledger["keys"][key]["public_key"].strip()
+            found = False
+            for pub_path in pub_files:
+                with open(pub_path, "r") as f:
+                    if target_pub in f.read().strip():
+                        identity_file = pub_path.with_suffix("")
+                        found = True
+                        break
+            if not found:
+                console.print(f"[bold yellow]Notice: Key '{key}' not found on attached device. Using default resident key.[/bold yellow]")
+
+        # 3. Build interactive SSH command
+        cmd_args = ["ssh", "-i", str(identity_file)]
+        if ssh_port:
+            cmd_args.extend(["-p", str(ssh_port)])
+
+        cmd_args.append(destination)
+        if command:
+            cmd_args.extend(command)
+
+        # 4. Hand over control to SSH interactively
+        env = GitEncryptedLedger._get_env()
+        try:
+            os.execvpe("ssh", cmd_args, env)
+        except Exception as e:
+            console.print(f"[bold red]Failed to execute SSH process:[bold red] {e}")
+            raise typer.Exit(1)
 
 if __name__ == "__main__":
     app()
