@@ -36,6 +36,7 @@ class GitEncryptedLedger:
     def _get_env() -> dict:
         env = os.environ.copy()
         env["PATH"] = ENV_PATH
+        env["HOME"] = str(Path.home())
         return env
 
     def _run_cmd(self, cmd: list, cwd: Optional[Path] = None, capture: bool = True) -> str:
