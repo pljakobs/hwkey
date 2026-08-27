@@ -131,8 +131,18 @@ def save_ledger(data: dict, action: str = "Update hwkey ledger"):
     ledger_mgr.save(data, commit_msg=action)
 
 # ----------------------------------------------------------------------
-# Setup Helpers & Maintenance Commands
+# Setup Helpers & Local Age Key Utilities
 # ----------------------------------------------------------------------
+
+def get_local_age_pubkey() -> Optional[str]:
+    """Reads the active local Age public key from ~/.config/sops/age/keys.txt."""
+    key_file = Path.home() / ".config" / "sops" / "age" / "keys.txt"
+    if key_file.exists():
+        with open(key_file, "r") as f:
+            for line in f:
+                if line.startswith("# public key:"):
+                    return line.split(":")[-1].strip()
+    return None
 
 def ensure_sops_config() -> List[str]:
     """Ensures a local Age key exists and writes a valid .sops.yaml file."""
@@ -141,13 +151,9 @@ def ensure_sops_config() -> List[str]:
     key_file = age_dir / "keys.txt"
     recipients: List[str] = []
 
-    if key_file.exists():
-        with open(key_file, "r") as f:
-            for line in f:
-                if line.startswith("# public key:"):
-                    pub = line.split(":")[-1].strip()
-                    recipients.append(pub)
-                    break
+    local_pub = get_local_age_pubkey()
+    if local_pub:
+        recipients.append(local_pub)
 
     if not recipients:
         console.print("[bold cyan]Generating local Age encryption key...[/bold cyan]")
@@ -229,6 +235,8 @@ def list_sops_keys():
         console.print("[bold red]Error: .sops.yaml missing. Run 'hwkey init' first.[/bold red]")
         raise typer.Exit(1)
 
+    local_pub = get_local_age_pubkey()
+
     with open(sops_config, "r") as f:
         config_data = yaml.safe_load(f) or {}
 
@@ -238,12 +246,13 @@ def list_sops_keys():
     if isinstance(existing_age, str):
         existing_age = [k.strip() for k in existing_age.split(",") if k.strip()]
 
-    table = Table(title="SOPS Age Recipient Keys")
-    table.add_column("#", style="dim")
+    table = Table(title="SOPS Age Recipient Keys (* = active local key)")
+    table.add_column("#", style="bold cyan", justify="right")
     table.add_column("Age Public Key Recipient", style="cyan")
 
     for idx, key in enumerate(existing_age, start=1):
-        table.add_row(str(idx), key)
+        num_str = f"*{idx}" if local_pub and key == local_pub else str(idx)
+        table.add_row(num_str, key)
 
     console.print(table)
 
@@ -324,6 +333,13 @@ def revoke_sops_key(
 
     clean_key = age_pubkey.strip()
 
+    # Anti-Foot-Gun Protection
+    local_pub = get_local_age_pubkey()
+    if local_pub and clean_key == local_pub:
+        console.print("[bold red]Security Guard triggered: You cannot revoke the active local key for this workstation![/bold red]")
+        console.print("[yellow]To replace this key, use 'hwkey rotate-sops-key' instead.[/yellow]")
+        raise typer.Exit(1)
+
     with open(sops_config, "r") as f:
         config_data = yaml.safe_load(f) or {}
 
@@ -377,6 +393,84 @@ def revoke_sops_key(
             console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
         except Exception as e:
             console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
+
+@app.command("rotate-sops-key")
+def rotate_sops_key():
+    """Generates a new local Age key, adds it to SOPS, re-encrypts ledger, and revokes the old local key."""
+    old_local_pub = get_local_age_pubkey()
+    if not old_local_pub:
+        console.print("[bold red]Error: No active local Age key found to rotate.[/bold red]")
+        raise typer.Exit(1)
+
+    console.print(f"[bold cyan]Current local Age key:[bold cyan] {old_local_pub}")
+
+    # 1. Generate new Age key in a temp file
+    age_dir = Path.home() / ".config" / "sops" / "age"
+    key_file = age_dir / "keys.txt"
+    new_key_file = age_dir / "keys.txt.new"
+
+    new_pubkey = None
+    try:
+        res = subprocess.run(
+            ["age-keygen", "-o", str(new_key_file)],
+            capture_output=True, text=True, check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+        for line in res.stderr.splitlines():
+            if "Public key:" in line:
+                new_pubkey = line.split(":")[-1].strip()
+                break
+    except Exception as e:
+        console.print(f"[bold red]Failed to generate new Age key:[bold red] {e}")
+        if new_key_file.exists():
+            new_key_file.unlink()
+        raise typer.Exit(1)
+
+    if not new_pubkey:
+        console.print("[bold red]Error parsing generated Age public key.[/bold red]")
+        if new_key_file.exists():
+            new_key_file.unlink()
+        raise typer.Exit(1)
+
+    console.print(f"[bold green]✔ Generated new local Age key:[bold green] {new_pubkey}")
+
+    # 2. Add new key to SOPS config while keeping the old key active
+    add_sops_key(new_pubkey)
+
+    # 3. Swap local key files so sops uses the new key for future loads
+    new_key_file.replace(key_file)
+    console.print("[dim green]✔ Activated new key in ~/.config/sops/age/keys.txt[/dim green]")
+
+    # 4. Revoke the old local key safely
+    sops_config = REPO_DIR / ".sops.yaml"
+    with open(sops_config, "r") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    rules = config_data.get("creation_rules", [{}])[0]
+    existing_age = rules.get("age", [])
+
+    if old_local_pub in existing_age:
+        existing_age.remove(old_local_pub)
+        rules["age"] = existing_age
+        config_data["creation_rules"] = [rules]
+
+        with open(sops_config, "w") as f:
+            yaml.dump(config_data, f, default_flow_style=False)
+
+        if LEDGER_PATH.exists():
+            subprocess.run(
+                ["sops", "updatekeys", "-y", str(LEDGER_PATH)],
+                cwd=REPO_DIR, check=True, capture_output=True,
+                env=GitEncryptedLedger._get_env()
+            )
+
+        if (REPO_DIR / ".git").exists():
+            env = GitEncryptedLedger._get_env()
+            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "commit", "-m", f"Rotate local SOPS key to {new_pubkey[:12]}"], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env=env)
+
+    console.print(f"[bold green]✔ Successfully rotated local Age key to {new_pubkey[:15]}...[/bold green]")
 
 # ----------------------------------------------------------------------
 # Device Management & SSH
