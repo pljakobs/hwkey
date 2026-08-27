@@ -94,7 +94,6 @@ class GitEncryptedLedger:
 
         raw_yaml = yaml.dump(data, default_flow_style=False)
 
-        # FIXED: Changed --filename-override to ledger.enc.yaml to match path_regex
         process = subprocess.Popen(
             ["sops", "--encrypt", "--filename-override", "ledger.enc.yaml", "/dev/stdin"],
             cwd=self.repo_dir,
@@ -156,7 +155,7 @@ def ensure_sops_config() -> List[str]:
             res = subprocess.run(
                 ["age-keygen", "-o", str(key_file)],
                 capture_output=True, text=True, check=True,
-                env={"PATH": ENV_PATH}
+                env=GitEncryptedLedger._get_env()
             )
             for line in res.stderr.splitlines():
                 if "Public key:" in line:
@@ -194,7 +193,7 @@ def init(
             f.write(sops_content)
 
     if not (REPO_DIR / ".git").exists():
-        subprocess.run(["git", "init", "-b", "main"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+        subprocess.run(["git", "init", "-b", "main"], cwd=REPO_DIR, check=True, env=GitEncryptedLedger._get_env())
         console.print("[bold green]✔ Initialized local Git repository.[/bold green]")
 
     console.print(f"[bold green]✔ Configured SOPS encryption with {len(recipients)} recipient key(s).[/bold green]")
@@ -208,18 +207,179 @@ def set_remote(
 ):
     """Configure or update the remote Git repository URL."""
     if not (REPO_DIR / ".git").exists():
-        subprocess.run(["git", "init", "-b", "main"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+        subprocess.run(["git", "init", "-b", "main"], cwd=REPO_DIR, check=True, env=GitEncryptedLedger._get_env())
 
-    res = subprocess.run(["git", "remote", "get-url", "origin"], cwd=REPO_DIR, capture_output=True, text=True, env={"PATH": ENV_PATH})
+    res = subprocess.run(["git", "remote", "get-url", "origin"], cwd=REPO_DIR, capture_output=True, text=True, env=GitEncryptedLedger._get_env())
     if res.returncode == 0:
-        subprocess.run(["git", "remote", "set-url", "origin", git_url], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+        subprocess.run(["git", "remote", "set-url", "origin", git_url], cwd=REPO_DIR, check=True, env=GitEncryptedLedger._get_env())
     else:
-        subprocess.run(["git", "remote", "add", "origin", git_url], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
+        subprocess.run(["git", "remote", "add", "origin", git_url], cwd=REPO_DIR, check=True, env=GitEncryptedLedger._get_env())
 
     console.print(f"[bold green]✔ Git remote 'origin' set to: {git_url}[/bold green]")
 
 # ----------------------------------------------------------------------
-# Device Management
+# SOPS Key Management
+# ----------------------------------------------------------------------
+
+@app.command("list-sops-keys")
+def list_sops_keys():
+    """List all Age recipient public keys configured in .sops.yaml."""
+    sops_config = REPO_DIR / ".sops.yaml"
+    if not sops_config.exists():
+        console.print("[bold red]Error: .sops.yaml missing. Run 'hwkey init' first.[/bold red]")
+        raise typer.Exit(1)
+
+    with open(sops_config, "r") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    rules = config_data.get("creation_rules", [{}])[0]
+    existing_age = rules.get("age", [])
+
+    if isinstance(existing_age, str):
+        existing_age = [k.strip() for k in existing_age.split(",") if k.strip()]
+
+    table = Table(title="SOPS Age Recipient Keys")
+    table.add_column("#", style="dim")
+    table.add_column("Age Public Key Recipient", style="cyan")
+
+    for idx, key in enumerate(existing_age, start=1):
+        table.add_row(str(idx), key)
+
+    console.print(table)
+
+@app.command("add-sops-key")
+def add_sops_key(
+    age_pubkey: str = typer.Argument(..., help="New Age recipient public key (starts with age1...)")
+):
+    """Add a new Age recipient public key to SOPS configuration and re-encrypt the ledger."""
+    sops_config = REPO_DIR / ".sops.yaml"
+    if not sops_config.exists():
+        console.print("[bold red]Error: .sops.yaml missing. Run 'hwkey init' first.[/bold red]")
+        raise typer.Exit(1)
+
+    clean_key = age_pubkey.strip()
+    if not clean_key.startswith("age1"):
+        console.print("[bold red]Invalid key format. Age public keys must start with 'age1'.[/bold red]")
+        raise typer.Exit(1)
+
+    with open(sops_config, "r") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    rules = config_data.get("creation_rules", [{}])[0]
+    existing_age = rules.get("age", [])
+
+    if isinstance(existing_age, str):
+        existing_age = [k.strip() for k in existing_age.split(",") if k.strip()]
+
+    if clean_key in existing_age:
+        console.print(f"[bold yellow]Age key {clean_key[:15]}... is already configured.[/bold yellow]")
+        return
+
+    existing_age.append(clean_key)
+    rules["age"] = existing_age
+    config_data["creation_rules"] = [rules]
+
+    with open(sops_config, "w") as f:
+        yaml.dump(config_data, f, default_flow_style=False)
+
+    console.print(f"[bold green]✔ Added recipient {clean_key[:15]}... to .sops.yaml[/bold green]")
+
+    if LEDGER_PATH.exists():
+        try:
+            res = subprocess.run(
+                ["sops", "updatekeys", "-y", str(LEDGER_PATH)],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                env=GitEncryptedLedger._get_env()
+            )
+            if res.returncode != 0:
+                console.print(f"[bold red]SOPS updatekeys failed:[bold red] {res.stderr.strip()}")
+                raise typer.Exit(1)
+
+            console.print("[dim green]✔ Re-encrypted ledger.enc.yaml with updated recipient list.[/dim green]")
+        except Exception as e:
+            console.print(f"[bold red]Failed to update SOPS keys:[bold red] {e}")
+            raise typer.Exit(1)
+
+    if (REPO_DIR / ".git").exists():
+        try:
+            env = GitEncryptedLedger._get_env()
+            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "commit", "-m", f"Add SOPS recipient {clean_key[:12]}"], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env=env)
+            console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
+        except Exception as e:
+            console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
+
+@app.command("revoke-sops-key")
+def revoke_sops_key(
+    age_pubkey: str = typer.Argument(..., help="Age recipient public key to remove (starts with age1...)")
+):
+    """Remove an Age recipient public key from SOPS configuration and re-encrypt the ledger."""
+    sops_config = REPO_DIR / ".sops.yaml"
+    if not sops_config.exists():
+        console.print("[bold red]Error: .sops.yaml missing. Run 'hwkey init' first.[/bold red]")
+        raise typer.Exit(1)
+
+    clean_key = age_pubkey.strip()
+
+    with open(sops_config, "r") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    rules = config_data.get("creation_rules", [{}])[0]
+    existing_age = rules.get("age", [])
+
+    if isinstance(existing_age, str):
+        existing_age = [k.strip() for k in existing_age.split(",") if k.strip()]
+
+    if clean_key not in existing_age:
+        console.print(f"[bold red]Key '{clean_key[:15]}...' not found in .sops.yaml recipient list.[/bold red]")
+        raise typer.Exit(1)
+
+    if len(existing_age) <= 1:
+        console.print("[bold red]Cannot revoke key: At least one SOPS recipient key must remain configured![/bold red]")
+        raise typer.Exit(1)
+
+    existing_age.remove(clean_key)
+    rules["age"] = existing_age
+    config_data["creation_rules"] = [rules]
+
+    with open(sops_config, "w") as f:
+        yaml.dump(config_data, f, default_flow_style=False)
+
+    console.print(f"[bold green]✔ Removed recipient {clean_key[:15]}... from .sops.yaml[/bold green]")
+
+    if LEDGER_PATH.exists():
+        try:
+            res = subprocess.run(
+                ["sops", "updatekeys", "-y", str(LEDGER_PATH)],
+                cwd=REPO_DIR,
+                capture_output=True,
+                text=True,
+                env=GitEncryptedLedger._get_env()
+            )
+            if res.returncode != 0:
+                console.print(f"[bold red]SOPS updatekeys failed:[bold red] {res.stderr.strip()}")
+                raise typer.Exit(1)
+
+            console.print("[dim green]✔ Re-encrypted ledger.enc.yaml with updated recipient list.[/dim green]")
+        except Exception as e:
+            console.print(f"[bold red]Failed to update SOPS keys:[bold red] {e}")
+            raise typer.Exit(1)
+
+    if (REPO_DIR / ".git").exists():
+        try:
+            env = GitEncryptedLedger._get_env()
+            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "commit", "-m", f"Revoke SOPS recipient {clean_key[:12]}"], cwd=REPO_DIR, check=True, env=env)
+            subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env=env)
+            console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
+        except Exception as e:
+            console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
+
+# ----------------------------------------------------------------------
+# Device Management & SSH
 # ----------------------------------------------------------------------
 
 def get_physical_usb_keys() -> list:
@@ -263,7 +423,7 @@ def scan_attached_yubikeys() -> list:
                 capture_output=True,
                 text=True,
                 check=True,
-                env={"PATH": ENV_PATH}
+                env=GitEncryptedLedger._get_env()
             )
 
             for key_file in Path(tmpdir).glob("*.pub"):
@@ -278,78 +438,6 @@ def scan_attached_yubikeys() -> list:
             console.print("[bold yellow]Note:[bold yellow] 'ssh-keygen -K' found no pre-existing resident keys.")
 
     return discovered_keys
-
-@app.command("add-sops-key")
-def add_sops_key(
-    age_pubkey: str = typer.Argument(..., help="New Age recipient public key (starts with age1...)")
-):
-    """Add a new Age recipient public key to SOPS configuration and re-encrypt the ledger."""
-    sops_config = REPO_DIR / ".sops.yaml"
-    if not sops_config.exists():
-        console.print("[bold red]Error: .sops.yaml missing. Run 'hwkey init' first.[/bold red]")
-        raise typer.Exit(1)
-
-    clean_key = age_pubkey.strip()
-    if not clean_key.startswith("age1"):
-        console.print("[bold red]Invalid key format. Age public keys must start with 'age1'.[/bold red]")
-        raise typer.Exit(1)
-
-    with open(sops_config, "r") as f:
-        config_data = yaml.safe_load(f) or {}
-
-    # Extract existing recipient list
-    rules = config_data.get("creation_rules", [{}])[0]
-    existing_age = rules.get("age", [])
-
-    if isinstance(existing_age, str):
-        existing_age = [k.strip() for k in existing_age.split(",") if k.strip()]
-
-    if clean_key in existing_age:
-        console.print(f"[bold yellow]Age key {clean_key[:15]}... is already configured.[/bold yellow]")
-        return
-
-    existing_age.append(clean_key)
-    rules["age"] = existing_age
-    config_data["creation_rules"] = [rules]
-
-    # Save updated .sops.yaml
-    with open(sops_config, "w") as f:
-        yaml.dump(config_data, f, default_flow_style=False)
-
-    console.print(f"[bold green]✔ Added recipient {clean_key[:15]}... to .sops.yaml[/bold green]")
-
-    # Re-encrypt ledger.enc.yaml if it exists
-    if LEDGER_PATH.exists():
-        try:
-            res = subprocess.run(
-                ["sops", "updatekeys", "-y", str(LEDGER_PATH)],
-                cwd=REPO_DIR,
-                capture_output=True,
-                text=True,
-                env={"PATH": ENV_PATH}
-            )
-            if res.returncode != 0:
-                console.print(f"[bold red]SOPS updatekeys failed:[bold red] {res.stderr.strip()}")
-                raise typer.Exit(1)
-
-            console.print("[dim green]✔ Re-encrypted ledger.enc.yaml with updated recipient list.[/dim green]")
-        except Exception as e:
-            console.print(f"[bold red]Failed to update SOPS keys:[bold red] {e}")
-            raise typer.Exit(1)
-
-    # Sync changes to Git
-    if (REPO_DIR / ".git").exists():
-        try:
-            subprocess.run(["git", "add", ".sops.yaml", str(LEDGER_PATH)], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
-            subprocess.run(["git", "commit", "-m", f"Add SOPS recipient {clean_key[:12]}"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
-            subprocess.run(["git", "push", "origin", "main"], cwd=REPO_DIR, check=True, env={"PATH": ENV_PATH})
-            console.print("[dim green]✔ Committed and pushed SOPS configuration to remote Git.[/dim green]")
-        except Exception as e:
-            console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
-
-# ----------------------------------------------------------------------
-# SSH Engine (Atomic Remote File Manipulation)
-# ----------------------------------------------------------------------
 
 def update_remote_authorized_keys(
     host_info: dict, 
@@ -536,7 +624,7 @@ def scan():
                     "-O", "resident",
                     "-C", alias,
                     "-f", str(key_path)
-                 ], check=True, env={"PATH": ENV_PATH})
+                 ], check=True, env=GitEncryptedLedger._get_env())
 
                 pubkey_path = Path(str(key_path) + ".pub")
                 with open(pubkey_path, "r") as f:
