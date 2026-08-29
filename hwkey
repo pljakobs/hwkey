@@ -209,7 +209,8 @@ def init(
 
 @app.command("set-remote")
 def set_remote(
-    git_url: str = typer.Argument(..., help="Remote Git URL (e.g. git@github.com:user/hwkey-ledger.git)")
+    git_url: str = typer.Argument(..., help="Remote Git URL (e.g. git@github.com:user/hwkey-ledger.git)"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Remote user associated with this repository")
 ):
     """Configure or update the remote Git repository URL."""
     if not (REPO_DIR / ".git").exists():
@@ -221,7 +222,39 @@ def set_remote(
     else:
         subprocess.run(["git", "remote", "add", "origin", git_url], cwd=REPO_DIR, check=True, env=GitEncryptedLedger._get_env())
 
-    console.print(f"[bold green]✔ Git remote 'origin' set to: {git_url}[/bold green]")
+    msg = f"[bold green]✔ Git remote 'origin' set to: {git_url}[/bold green]"
+    if user:
+        msg += f" [dim](Remote user: {user})[/dim]"
+    console.print(msg)
+
+@app.command("show-remotes")
+def show_remotes():
+    """Show registered remote servers known to the ledger."""
+    ledger = load_ledger()
+    hosts = ledger.get("hosts", {})
+
+    if not hosts:
+        console.print("[bold yellow]No remote hosts registered in the ledger.[/bold yellow]")
+        return
+
+    table = Table(title="Registered Remote Hosts")
+    table.add_column("Alias / Name", style="cyan")
+    table.add_column("Hostname / IP", style="magenta")
+    table.add_column("User", style="yellow")
+    table.add_column("Port", style="blue")
+    table.add_column("Deployed Keys", style="green")
+
+    for alias, host_info in hosts.items():
+        deployed_keys = ", ".join(host_info.get("deployed_keys", [])) or "None"
+        table.add_row(
+            alias,
+            host_info.get("hostname", "N/A"),
+            host_info.get("user", "N/A"),
+            str(host_info.get("port", 22)),
+            deployed_keys
+        )
+
+    console.print(table)
 
 # ----------------------------------------------------------------------
 # SOPS Key Management
