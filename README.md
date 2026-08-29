@@ -11,14 +11,14 @@ It maintains an encrypted, central Git-backed ledger of authorized hardware keys
 In my view, hwkey solves a problem for for small teams and homelab/infrastructure engineers, though it operates in a middle ground between basic personal tools and enterprise access management.
 
 * **The Core Problem It Solves**: Managing SSH keys on remote servers usually becomes a mess. People either share static, unencrypted `authorized_keys` files, use manual copy-pasting, or rely on plaintext Ansible/Puppet manifests to push keys. `hwkey` solves this by giving you **GitOps-driven, encrypted access control** coupled with mandatory **hardware token enforcement** (FIDO2/YubiKey).
-* **Where It Shines**:
+* **What it provides**:
   * **Encrypted Metadata**: Unlike storing public keys in open Git repos, encrypting the ledger with SOPS/Age hides hostnames, user accounts, and key mappings from prying eyes.
   * **Hardware Enforcement**: Forcing `ssh-ed25519-sk` means keys cannot be copied off a developer's machine; a physical touch/PIN is strictly required.
   * **Automated Lifecycle**: Doing key rotation or global key revocation across a fleet of remote servers manually via Paramiko/SFTP is tedious; `hwkey` turns that into a single CLI command.
 * **The Caveat (Where It Hits Limits)**:
   * **Scale**: Because it relies on direct SFTP/SSH updates to `~/.ssh/authorized_keys`, it works exceptionally well for tens or hundreds of static nodes. At true enterprise scale (thousands of instances), infrastructure teams move away from managing individual `authorized_keys` files altogether and switch to **Ephemeral SSH Certificates** or **OIDC identity proxies**.
 
-*Multi user considerations*
+# Multi user considerations
 There is a key architectural limitation of `hwkey`: by it's current design, it can only allow access for all registered keys to all registered hosts, it is not an integrated access privileges management tool. It is intended for one person to securely use ssh keys for the hosts they have access to. If two or more users manage their keys using this tool, their remote keys will live in their respective `~/.ssh` directories. If they use the same service user, the keys *should* coexist in the joint `authorized_keys` file, identified by the tracking tags.
 Shared ledgers (so shared github repos) or simultaneous writes will probably lead to failurs.
 ---
