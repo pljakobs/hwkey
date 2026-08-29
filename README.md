@@ -6,7 +6,7 @@ Markdown
 
 It maintains an encrypted, central Git-backed ledger of authorized hardware keys and target remote hosts, allowing you to atomically deploy, rotate, and revoke SSH resident keys across your entire infrastructure. It also provides an interactive SSH wrapper to connect seamlessly using hardware key stubs on demand.
 
-# rationale
+# Rationale
 
 In my view, hwkey solves a problem for for small teams and homelab/infrastructure engineers, though it operates in a middle ground between basic personal tools and enterprise access management.
 
@@ -18,7 +18,8 @@ In my view, hwkey solves a problem for for small teams and homelab/infrastructur
 * **The Caveat (Where It Hits Limits)**:
   * **Scale**: Because it relies on direct SFTP/SSH updates to `~/.ssh/authorized_keys`, it works exceptionally well for tens or hundreds of static nodes. At true enterprise scale (thousands of instances), infrastructure teams move away from managing individual `authorized_keys` files altogether and switch to **Ephemeral SSH Certificates** or **OIDC identity proxies**.
 
-# Multi user considerations
+## Multi user considerations
+
 There is a key architectural limitation of `hwkey`: by it's current design, it can only allow access for all registered keys to all registered hosts, it is not an integrated access privileges management tool. It is intended for one person to securely use ssh keys for the hosts they have access to. If two or more users manage their keys using this tool, their remote keys will live in their respective `~/.ssh` directories. If they use the same service user, the keys *should* coexist in the joint `authorized_keys` file, identified by the tracking tags.
 Shared ledgers (so shared github repos) or simultaneous writes will probably lead to failurs.
 ---
