@@ -24,13 +24,13 @@ In my view, hwkey solves a problem for for small teams and homelab/infrastructur
 
 > **CRITICAL CAVEAT: MANDATORY BACKUP HARDWARE KEYS**
 > 
-> Resident SSH keys (`ssh-ed25519-sk`) are stored **exclusively inside the hardware security token's secure element**[cite: 5]. By design, private key material cannot be extracted, exported, or backed up[cite: 5].
+> Resident SSH keys (`ssh-ed25519-sk`) are stored **exclusively inside the hardware security token's secure element**. By design, private key material cannot be extracted, exported, or backed up.
 > 
 > **If you lose your hardware token, forget its PIN, or the hardware breaks, the key is permanently unrecoverable.** 
 > 
 > Using `hwkey` safely mandates enrolling **at least two independent hardware keys** (a primary and a physically separated backup/spare) into the ledger. When a server host is registered via `hwkey host add`, `hwkey` automatically deploys **all active hardware public keys** to the server's `authorized_keys` file, ensuring you retain access if your main YubiKey is lost.
 
-* **Hardware Authentication (`ssh-ed25519-sk`):** Private SSH keys never leave the YubiKey secure element. Touch presence and optional PIN are enforced for every connection[cite: 4].
+* **Hardware Authentication (`ssh-ed25519-sk`):** Private SSH keys never leave the YubiKey secure element. Touch presence and optional PIN are enforced for every connection.
 * **Ledger Encryption (SOPS + Age):** The Git repository holds encrypted data (`ledger.enc.yaml`). Server hostnames, username metadata, and public key mappings are unreadable without an authorized Age private key.
 * **Workstation Authorization:** Multi-workstation access is managed safely via `hwkey sops add` and `hwkey sops revoke`, allowing seamless onboarding and offboarding without sharing private keys.
 
