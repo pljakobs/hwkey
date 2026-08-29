@@ -24,11 +24,16 @@ In my view, hwkey solves a problem for for small teams and homelab/infrastructur
 
 > **CRITICAL CAVEAT: MANDATORY BACKUP HARDWARE KEYS**
 > 
-> Resident SSH keys (`ssh-ed25519-sk`) are stored **exclusively inside the hardware security token's secure element**. By design, private key material cannot be extracted, exported, or backed up.
+> **1. Hardware Keys (YubiKeys):**
+> Resident SSH keys (`ssh-ed25519-sk`) are stored **exclusively inside the hardware security token's secure element**. Private key material cannot be extracted or exported. If you lose your token, forget its PIN, or the hardware breaks, that specific key is permanently lost.
 > 
-> **If you lose your hardware token, forget its PIN, or the hardware breaks, the key is permanently unrecoverable.** 
+> * **Mitigation:** Enroll **at least two independent hardware keys** (primary and backup) into the ledger. `hwkey` automatically deploys all active hardware public keys to remote target hosts during host registration.
+>
+> **2. Workstation Decryption Keys (SOPS / Age):**
+> The central ledger (`ledger.enc.yaml`) is encrypted using Age public keys. If you lose your local private Age key (`~/.config/sops/age/keys.txt`), **the ledger becomes unreadable**. 
 > 
-> Using `hwkey` safely mandates enrolling **at least two independent hardware keys** (a primary and a physically separated backup/spare) into the ledger. When a server host is registered via `hwkey host add`, `hwkey` automatically deploys **all active hardware public keys** to the server's `authorized_keys` file, ensuring you retain access if your main YubiKey is lost.
+> * While losing the SOPS key does **not** break standard SSH access (if persistent stubs exist in `~/.ssh/`), it completely disables all `hwkey` management functionality (`host add`, `key revoke`, `key rotate`, `hwkey ssh`).
+> * **Mitigation:** Securely back up your private Age key (`~/.config/sops/age/keys.txt`) to an offline vault, or authorize multiple workstation Age keys in `.sops.yaml` using `hwkey sops add <age_pubkey>`.
 
 * **Hardware Authentication (`ssh-ed25519-sk`):** Private SSH keys never leave the YubiKey secure element. Touch presence and optional PIN are enforced for every connection.
 * **Ledger Encryption (SOPS + Age):** The Git repository holds encrypted data (`ledger.enc.yaml`). Server hostnames, username metadata, and public key mappings are unreadable without an authorized Age private key.
