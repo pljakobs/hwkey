@@ -5,7 +5,7 @@ import yaml
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import typer
 import paramiko
@@ -153,7 +153,7 @@ def save_ledger(data: dict, action: str = "Update hwkey ledger"):
     ledger_mgr.save(data, commit_msg=action)
 
 # ----------------------------------------------------------------------
-# Setup Helpers & Local Age Key Utilities
+# Setup Helpers & Managed Key Utilities
 # ----------------------------------------------------------------------
 
 def get_local_age_pubkey() -> Optional[str]:
@@ -204,12 +204,32 @@ def ensure_sops_config() -> List[str]:
 
     return recipients
 
+def format_managed_key_line(pubkey: str, key_alias: str) -> str:
+    """Appends a hwkey tracking tag to public key entries."""
+    clean_pub = pubkey.strip()
+    return f"{clean_pub} hwkey:{key_alias}"
+
+def parse_authorized_keys_line(line: str) -> Tuple[str, Optional[str]]:
+    """Extracts raw key string and hwkey tag if present."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return line, None
+    
+    parts = line.split()
+    managed_alias = None
+    for part in parts:
+        if part.startswith("hwkey:"):
+            managed_alias = part.split(":", 1)[1]
+            break
+            
+    return line, managed_alias
+
 def update_remote_authorized_keys(
     host_info: dict, 
-    keys_to_add: List[str], 
-    keys_to_remove: List[str]
+    keys_to_add: List[Tuple[str, str]],  # List of (key_alias, pubkey)
+    keys_to_remove_aliases: List[str]
 ) -> bool:
-    """Connects via Paramiko SFTP and updates ~/.ssh/authorized_keys atomically."""
+    """Connects via Paramiko SFTP and updates ~/.ssh/authorized_keys safely with key tags."""
     hostname = host_info["hostname"]
     port = host_info.get("port", 22)
     user = host_info.get("user", os.getlogin())
@@ -223,25 +243,38 @@ def update_remote_authorized_keys(
         sftp = client.open_sftp()
 
         auth_keys_path = ".ssh/authorized_keys"
-        remote_keys = []
+        existing_lines = []
         
         try:
             with sftp.open(auth_keys_path, "r") as f:
-                remote_keys = [line.strip() for line in f.readlines() if line.strip()]
+                existing_lines = [line.strip() for line in f.readlines() if line.strip()]
         except FileNotFoundError:
             try:
                 sftp.mkdir(".ssh")
             except IOError:
                 pass
 
-        updated_keys = [k for k in remote_keys if k not in keys_to_remove]
-        for k in keys_to_add:
-            if k not in updated_keys:
-                updated_keys.append(k)
+        # Preserve unmanaged/out-of-band keys and filter removed managed keys
+        retained_lines = []
+        for line in existing_lines:
+            raw_line, managed_alias = parse_authorized_keys_line(line)
+            if managed_alias and managed_alias in keys_to_remove_aliases:
+                continue
+            retained_lines.append(raw_line)
+
+        # Update or add missing managed keys with tags
+        for k_alias, k_pubkey in keys_to_add:
+            formatted = format_managed_key_line(k_pubkey, k_alias)
+            # Remove older references to the same key alias if re-adding
+            retained_lines = [
+                l for l in retained_lines 
+                if parse_authorized_keys_line(l)[1] != k_alias
+            ]
+            retained_lines.append(formatted)
 
         temp_remote = f".ssh/authorized_keys.tmp.{os.urandom(4).hex()}"
         with sftp.open(temp_remote, "w") as f:
-            f.write("\n".join(updated_keys) + "\n")
+            f.write("\n".join(retained_lines) + "\n")
         
         sftp.chmod(temp_remote, 0o600)
         sftp.posix_rename(temp_remote, auth_keys_path)
@@ -366,7 +399,9 @@ def ssh(
 
         env = GitEncryptedLedger._get_env()
         try:
-            os.execvpe("ssh", cmd_args, env)
+            # FIX ITEM 2: Run subprocess instead of process replacement (execvpe)
+            # so the TemporaryDirectory wrapper stays active and cleans up stub files on exit.
+            subprocess.run(cmd_args, env=env)
         except Exception as e:
             console.print(f"[bold red]Failed to execute SSH process:[bold red] {e}")
             raise typer.Exit(1)
@@ -396,15 +431,73 @@ def register_host(
         "port": port,
         "deployed_keys": list(ledger["keys"].keys())
     }
-    keys_to_deploy = [k_info["public_key"] for k_info in ledger["keys"].values()]
+    keys_to_deploy = [(k_alias, k_info["public_key"]) for k_alias, k_info in ledger["keys"].items()]
 
-    success = update_remote_authorized_keys(host_info, keys_to_add=keys_to_deploy, keys_to_remove=[])
+    success = update_remote_authorized_keys(host_info, keys_to_add=keys_to_deploy, keys_to_remove_aliases=[])
     
     if success:
         hosts = ledger.setdefault("hosts", [])
         ledger["hosts"] = [h for h in hosts if not (h.get("alias") == host_alias and h.get("user") == user)]
         ledger["hosts"].append(host_info)
         save_ledger(ledger, action=f"Register host {user}@{host_alias}")
+
+@host_app.command("scan")
+def scan_host_keys(
+    alias_or_host: str = typer.Argument(..., help="Host alias or hostname to inspect for state drift")
+):
+    """Inspect a remote target server's authorized_keys to detect managed vs unmanaged key drift."""
+    ledger = load_ledger()
+    hosts = ledger.get("hosts", [])
+    
+    matching_host = next(
+        (h for h in hosts if h.get("alias") == alias_or_host or h.get("hostname") == alias_or_host), 
+        None
+    )
+
+    if not matching_host:
+        console.print(f"[bold red]Host entry '{alias_or_host}' not found in ledger.[/bold red]")
+        raise typer.Exit(1)
+
+    hostname = matching_host["hostname"]
+    port = matching_host.get("port", 22)
+    user = matching_host.get("user", os.getlogin())
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        console.print(f"[bold blue]Connecting to {user}@{hostname}:{port}...[/bold blue]")
+        client.connect(hostname=hostname, port=port, username=user, timeout=10)
+        sftp = client.open_sftp()
+
+        auth_keys_path = ".ssh/authorized_keys"
+        existing_lines = []
+        with sftp.open(auth_keys_path, "r") as f:
+            existing_lines = [line.strip() for line in f.readlines() if line.strip()]
+
+        sftp.close()
+        client.close()
+
+        table = Table(title=f"Remote State Inspection: {user}@{hostname}")
+        table.add_column("Key Line Excerpt", style="cyan")
+        table.add_column("Management Status", style="magenta")
+        table.add_column("hwkey Tag Alias", style="green")
+
+        for line in existing_lines:
+            raw_line, managed_alias = parse_authorized_keys_line(line)
+            excerpt = f"{raw_line[:30]}...{raw_line[-15:]}" if len(raw_line) > 45 else raw_line
+            
+            if managed_alias:
+                status = "[green]Managed by hwkey[/green]"
+            else:
+                status = "[yellow]Unmanaged (Out-of-Band)[/yellow]"
+
+            table.add_row(excerpt, status, managed_alias or "None")
+
+        console.print(table)
+
+    except Exception as e:
+        console.print(f"[bold red]✖ Failed to scan target host {hostname}: {e}[/bold red]")
 
 @host_app.command("list")
 def list_hosts():
@@ -600,7 +693,7 @@ def scan_keys():
 
     for item in discovered_keys:
         pub = item["public_key"]
-        # Check if public key is already registered in ledger
+
         existing_alias = next((k for k, v in ledger.get("keys", {}).items() if v.get("public_key") == pub), None)
 
         if existing_alias:
@@ -654,7 +747,6 @@ def rotate_key(
         console.print(f"[bold red]Key '{old_key_id}' not found in ledger.[/bold red]")
         raise typer.Exit(1)
 
-    old_pubkey = ledger["keys"][old_key_id]["public_key"]
     ledger["keys"][new_key_id] = {"public_key": new_pubkey.strip()}
 
     failed_hosts = []
@@ -662,8 +754,8 @@ def rotate_key(
         if old_key_id in host_info.get("deployed_keys", []):
             success = update_remote_authorized_keys(
                 host_info,
-                keys_to_add=[new_pubkey.strip()],
-                keys_to_remove=[old_pubkey]
+                keys_to_add=[(new_key_id, new_pubkey.strip())],
+                keys_to_remove_aliases=[old_key_id]
             )
             if success:
                 host_info["deployed_keys"].remove(old_key_id)
@@ -689,18 +781,19 @@ def revoke_key(
         console.print(f"[bold red]Key '{key_id}' not found in ledger.[/bold red]")
         raise typer.Exit(1)
 
-    target_pubkey = ledger["keys"][key_id]["public_key"]
-
     for host_info in ledger.get("hosts", []):
         if key_id in host_info.get("deployed_keys", []):
-            success = update_remote_authorized_keys(host_info, keys_to_add=[], keys_to_remove=[target_pubkey])
+            success = update_remote_authorized_keys(
+                host_info, 
+                keys_to_add=[], 
+                keys_to_remove_aliases=[key_id]
+            )
             if success:
                 host_info["deployed_keys"].remove(key_id)
 
     del ledger["keys"][key_id]
     save_ledger(ledger, action=f"Revoke key {key_id}")
     console.print(f"[bold green]✔ Key '{key_id}' retired and revoked across all reachable hosts.[/bold green]")
-
 
 # ----------------------------------------------------------------------
 # Entity 3: SOPS Keys Domain (`hwkey sops <cmd>`)
