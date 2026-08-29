@@ -46,6 +46,15 @@ Shared ledgers (so shared github repos) or simultaneous writes will probably lea
 
 ---
 
+## git repo access
+> **CRITICAL CAVEAT: REPO ACCESS**
+>
+> the ledger is distributed through a remote git infrastructure such as github, gitlab, gitea etc
+> access to the ledger does not necessarily expose any weaknesses, but if the access to the git system is authenticated by a host stored ssh key, that weakens the overal security position as an attacker could manipualte the ledger globally.
+> You should strongly consider authenticating to the git backend using the on-hardware ssh key (can be exported using `ssh-keygen -t ed25519-sk -O resident -O verify-required -f ~/.ssh/id_ed25519_sk?`)
+
+---
+
 ## Architecture Overview
 
 ```
