@@ -204,6 +204,49 @@ def ensure_sops_config() -> List[str]:
 
     return recipients
 
+def ensure_yubikey_pin(serial: Optional[str] = None):
+    """Checks if a FIDO PIN is set on the specified YubiKey and prompts to set one if missing."""
+    try:
+        cmd = ["ykman"]
+        if serial:
+            cmd.extend(["--device", serial])
+        cmd.extend(["fido", "info"])
+
+        res = subprocess.run(
+            cmd,
+            input="\n",  # Send empty newline to bypass any prompt safely
+            capture_output=True, text=True, check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+
+        # Robustly parse output line-by-line to handle varying whitespace formatting
+        pin_not_set = False
+        for line in res.stdout.splitlines():
+            lower_line = line.lower().strip()
+            if lower_line.startswith("pin:") and "not set" in lower_line:
+                pin_not_set = True
+                break
+
+        if pin_not_set:
+            target_desc = f" (Serial: {serial})" if serial else ""
+            console.print(f"[bold yellow]Notice: No FIDO PIN is set on hardware key{target_desc}.[/bold yellow]")
+            if typer.confirm("A PIN is recommended for security. Would you like to set one now?", default=True):
+                new_pin = typer.prompt("Enter new FIDO PIN", hide_input=True, confirmation_prompt=True)
+                change_cmd = ["ykman"]
+                if serial:
+                    change_cmd.extend(["--device", serial])
+                change_cmd.extend(["fido", "access", "change-pin"])
+
+                subprocess.run(
+                    change_cmd,
+                    input=f"\n{new_pin}\n{new_pin}\n",
+                    capture_output=True, text=True, check=True,
+                    env=GitEncryptedLedger._get_env()
+                )
+                console.print("[bold green]✔ FIDO PIN successfully configured.[/bold green]")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
 def format_managed_key_line(pubkey: str, key_alias: str) -> str:
     """Appends a hwkey tracking tag to public key entries."""
     clean_pub = pubkey.strip()
@@ -571,6 +614,9 @@ def enroll_key(
     key_id: str = typer.Option(None, "--id", "-i", help="Unique ledger identifier for the new key"),
     application: str = typer.Option("hwkey", "--application", "-a", help="Key comment/application tag")
 ):
+
+    ensure_yubikey_pin()
+
     """Generate a brand-new resident SSH key on the physical YubiKey and record it in the ledger."""
     console.print("[bold blue]Generating new resident credential on physical token...[/bold blue]")
 
@@ -637,8 +683,19 @@ def generate_stubs(
 
 @key_app.command("scan")
 def scan_keys():
-    """Scan attached YubiKeys and sync existing hardware resident keys into the ledger."""
+    """Scan attached YubiKeys, check registration status in ledger, and sync hardware resident keys."""
     console.print("[bold blue]Scanning USB bus for physical hardware keys...[/bold blue]")
+
+    serials = []
+    try:
+        res = subprocess.run(
+            ["ykman", "list", "--serials"],
+            capture_output=True, text=True, check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+        serials = [s.strip() for s in res.stdout.splitlines() if s.strip()]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
 
     devices = []
     for dev in CtapHidDevice.list_devices():
@@ -661,8 +718,16 @@ def scan_keys():
         return
 
     console.print(f"[bold cyan]Found {len(devices)} physical hardware key device(s):[/bold cyan]")
-    for dev in devices:
-        console.print(f"  • {dev['product_name']} (VID: {dev['vendor_id']} PID: {dev['product_id']})")
+    
+    ledger = load_ledger()
+
+    for idx, dev in enumerate(devices):
+        dev_serial = serials[idx] if idx < len(serials) else None
+        serial_display = f" [dim](Serial: {dev_serial})[/dim]" if dev_serial else ""
+        console.print(f"  • {dev['product_name']}{serial_display} (VID: {dev['vendor_id']} PID: {dev['product_id']})")
+        
+        # Talk specifically to this key index/serial for PIN validation
+        ensure_yubikey_pin(dev_serial)
 
     discovered_keys = []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -682,24 +747,22 @@ def scan_keys():
                         "public_key": f.read().strip()
                     })
         except subprocess.CalledProcessError:
-            console.print("[bold yellow]Note: 'ssh-keygen -K' found no pre-existing resident keys on token.[/bold yellow]")
+            console.print("[bold yellow]Note: 'ssh-keygen -K' found no pre-existing resident keys on tokens.[/bold yellow]")
 
     if not discovered_keys:
         console.print("[dim yellow]No resident keys to sync. Use 'hwkey key enroll' if you wish to provision a new key.[/dim yellow]")
         return
 
-    ledger = load_ledger()
     updated = False
 
     for item in discovered_keys:
         pub = item["public_key"]
-
         existing_alias = next((k for k, v in ledger.get("keys", {}).items() if v.get("public_key") == pub), None)
 
         if existing_alias:
-            console.print(f"[dim green]• Key matching '{existing_alias}' is already registered.[/dim green]")
+            console.print(f"[dim green]  ✔ Resident key already registered in ledger under alias: '{existing_alias}'[/dim green]")
         else:
-            auto_alias = typer.prompt(f"Found new resident key ({pub[:15]}...). Enter alias", default=f"yubi_key_{len(ledger.get('keys', {})) + 1}")
+            auto_alias = typer.prompt(f"Found unregistered resident key ({pub[:15]}...). Enter alias", default=f"yubi_key_{len(ledger.get('keys', {})) + 1}")
             ledger["keys"][auto_alias] = {"public_key": pub}
             console.print(f"[bold green]✔ Enrolled '{auto_alias}' into ledger[/bold green]")
             updated = True
