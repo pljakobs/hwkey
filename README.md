@@ -186,8 +186,10 @@ hwkey ssh web-prod
 
 | Command | Description |
 | :--- | :--- |
-| `hwkey host add <hostname> [-a <alias>] [-u <user>] [-p <port>]` | Registers a target server host entry and deploys all active ledger keys to it. |
+| `hwkey host add <hostname> [-a <alias>] [-u <user>] [-p <port>] [-b <bastion>] [-A <auth_key>]` | Registers a target server host entry and deploys all active ledger keys to it. |
 | `hwkey host list` | Lists all registered target hosts in the encrypted ledger. |
+| `hwkey host set-bastion <target> <bastion> [-u <user>]` | Routes a registered target host through another registered ledger host using OpenSSH `ProxyJump`. |
+| `hwkey host clear-bastion <target> [-u <user>]` | Removes bastion routing metadata from a registered host. |
 | `hwkey host remove <alias_or_host> [-u <user>]` | Removes a target host entry from the encrypted ledger. |
 
 ### Hardware Key Domain (`hwkey key`)
@@ -219,6 +221,7 @@ hwkey ssh web-prod
 | :--- | :--- |
 | `hwkey git set-remote <git_url>` | Configures or updates the origin remote Git repository URL. |
 | `hwkey git show-remotes` | Displays registered Git remotes configured for the ledger. |
+| `hwkey git log [-n <limit>] [-s]` | Shows the most recent ledger operations, who performed them, and their commit signature status. |
 
 ---
 
@@ -246,6 +249,24 @@ Check the installed tool version with:
 ```bash
 hwkey version
 ```
+
+## Bastion Hosts
+
+Register the bastion like any other host, then attach it to hosts that are only reachable through that intermediary:
+
+```bash
+hwkey host add bastion.example.com --alias bastion --user admin
+hwkey host add internal.example.com --alias internal --user root --bastion bastion --auth-key yubi_primary
+```
+
+For existing hosts:
+
+```bash
+hwkey host set-bastion internal bastion
+hwkey key resync --key yubi_backup --auth-key yubi_primary
+```
+
+`hwkey ssh` and OpenSSH-backed key rollout use `ssh -J` with the bastion's ledger user, hostname, and port. Private keys are not copied to the bastion; authentication still uses the local hardware-backed resident key stub.
 
 # Existing Alternatives
 

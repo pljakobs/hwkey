@@ -18,9 +18,9 @@ from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2, ClientPin
 from fido2.ctap2.credman import CredentialManagement
 
-HWKEY_VERSION = "0.2.0"
+HWKEY_VERSION = "0.3.0"
 LEDGER_SCHEMA_VERSION = 1
-MIN_LEDGER_HWKEY_VERSION = "0.2.0"
+MIN_LEDGER_HWKEY_VERSION = "0.3.0"
 
 app = typer.Typer(help="Hardware SSH Key Ledger & Remote Manager")
 console = Console()
@@ -87,6 +87,35 @@ def check_ledger_compatibility(data: dict):
         )
         console.print(f"[yellow]The ledger was last updated by {last_writer}. Please update hwkey before continuing.[/yellow]")
         raise typer.Exit(1)
+
+def host_label(host_info: dict) -> str:
+    user = host_info.get("user")
+    alias = host_info.get("alias", host_info.get("hostname", "unknown"))
+    return f"{user}@{alias}" if user else alias
+
+def find_host(ledger: dict, alias_or_host: str, user: Optional[str] = None) -> Optional[dict]:
+    for host_info in ledger.get("hosts", []):
+        if host_info.get("alias") == alias_or_host or host_info.get("hostname") == alias_or_host:
+            if user and host_info.get("user") != user:
+                continue
+            return host_info
+    return None
+
+def bastion_jump_arg(ledger: dict, host_info: dict) -> Optional[str]:
+    bastion_ref = host_info.get("bastion")
+    if not bastion_ref:
+        return None
+
+    bastion = find_host(ledger, bastion_ref)
+    if not bastion:
+        console.print(f"[bold red]Bastion '{bastion_ref}' for {host_label(host_info)} is not registered in the ledger.[/bold red]")
+        raise typer.Exit(1)
+
+    user = bastion.get("user")
+    hostname = bastion["hostname"]
+    port = bastion.get("port", 22)
+    target = f"{user}@{hostname}" if user else hostname
+    return f"{target}:{port}" if port != 22 else target
 
 # ----------------------------------------------------------------------
 # Encrypted Git Ledger Engine
@@ -518,23 +547,27 @@ def update_remote_authorized_keys_via_openssh(
     host_info: dict,
     keys_to_add: List[Tuple[str, str]],
     keys_to_remove_aliases: List[str],
-    identity_file: Path
+    identity_file: Optional[Path] = None,
+    ledger: Optional[dict] = None
 ) -> bool:
     """Update authorized_keys through OpenSSH so FIDO-backed identities work."""
     hostname = host_info["hostname"]
     port = host_info.get("port", 22)
     user = host_info.get("user", os.getlogin())
     target = f"{user}@{hostname}"
-    ssh_cmd = [
-        "ssh",
-        "-i", str(identity_file),
-        "-o", "IdentitiesOnly=yes",
-        "-p", str(port),
-        target
-    ]
+    ssh_cmd = ["ssh"]
+    if identity_file:
+        ssh_cmd.extend(["-i", str(identity_file), "-o", "IdentitiesOnly=yes"])
+    ssh_cmd.extend(["-p", str(port)])
+    if ledger:
+        jump_arg = bastion_jump_arg(ledger, host_info)
+        if jump_arg:
+            ssh_cmd.extend(["-J", jump_arg])
+    ssh_cmd.append(target)
 
     try:
-        console.print(f"[bold blue]Connecting to {target}:{port} using {identity_file.name}...[/bold blue]")
+        identity_desc = f" using {identity_file.name}" if identity_file else ""
+        console.print(f"[bold blue]Connecting to {target}:{port}{identity_desc}...[/bold blue]")
         read_res = subprocess.run(
             ssh_cmd + ["test -f .ssh/authorized_keys && cat .ssh/authorized_keys || true"],
             stdout=subprocess.PIPE,
@@ -579,15 +612,17 @@ def update_remote_authorized_keys(
     host_info: dict, 
     keys_to_add: List[Tuple[str, str]],  # List of (key_alias, pubkey)
     keys_to_remove_aliases: List[str],
-    identity_file: Optional[Path] = None
+    identity_file: Optional[Path] = None,
+    ledger: Optional[dict] = None
 ) -> bool:
     """Connects via Paramiko SFTP and updates ~/.ssh/authorized_keys safely with key tags."""
-    if identity_file:
+    if identity_file or (ledger and host_info.get("bastion")):
         return update_remote_authorized_keys_via_openssh(
             host_info,
             keys_to_add=keys_to_add,
             keys_to_remove_aliases=keys_to_remove_aliases,
-            identity_file=identity_file
+            identity_file=identity_file,
+            ledger=ledger
         )
 
     hostname = host_info["hostname"]
@@ -675,7 +710,8 @@ def deploy_keys_to_registered_hosts(
                     host_info,
                     keys_to_add=keys_to_deploy,
                     keys_to_remove_aliases=[],
-                    identity_file=identity_file
+                    identity_file=identity_file,
+                    ledger=ledger
                 )
                 host_alias = host_info.get("alias", host_info.get("hostname", "unknown"))
                 if success:
@@ -692,7 +728,8 @@ def deploy_keys_to_registered_hosts(
         success = update_remote_authorized_keys(
             host_info,
             keys_to_add=keys_to_deploy,
-            keys_to_remove_aliases=[]
+            keys_to_remove_aliases=[],
+            ledger=ledger
         )
         host_alias = host_info.get("alias", host_info.get("hostname", "unknown"))
         if success:
@@ -751,7 +788,8 @@ def resync_ledger_deployments(ledger: dict, key_id: Optional[str] = None, auth_k
                 host_info,
                 keys_to_add=missing_keys,
                 keys_to_remove_aliases=[],
-                identity_file=identity_file
+                identity_file=identity_file,
+                ledger=ledger
             )
             if success:
                 deployed_keys = host_info.setdefault("deployed_keys", [])
@@ -830,13 +868,7 @@ def ssh(
         if not resolved_user:
             resolved_user = inline_user
 
-    matching_host = None
-    for h in hosts:
-        if h.get("alias") == resolved_hostname or h.get("hostname") == resolved_hostname:
-            if user and h.get("user") != user:
-                continue
-            matching_host = h
-            break
+    matching_host = find_host(ledger, resolved_hostname, user=user)
 
     if matching_host:
         resolved_hostname = matching_host["hostname"]
@@ -884,6 +916,10 @@ def ssh(
         cmd_args = ["ssh", "-i", str(identity_file)]
         if resolved_port:
             cmd_args.extend(["-p", str(resolved_port)])
+        if matching_host:
+            jump_arg = bastion_jump_arg(ledger, matching_host)
+            if jump_arg:
+                cmd_args.extend(["-J", jump_arg])
 
         cmd_args.append(destination)
         if command:
@@ -907,7 +943,9 @@ def register_host(
     hostname: str = typer.Argument(..., help="IP or FQDN of host"),
     alias: Optional[str] = typer.Option(None, "--alias", "-a", help="Optional alias for the host"),
     user: str = typer.Option(os.getlogin(), "--user", "-u", help="Remote SSH user"),
-    port: int = typer.Option(22, "--port", "-p", help="SSH port")
+    port: int = typer.Option(22, "--port", "-p", help="SSH port"),
+    bastion: Optional[str] = typer.Option(None, "--bastion", "-b", help="Ledger host alias/hostname to use as SSH bastion"),
+    auth_key: Optional[str] = typer.Option(None, "--auth-key", "-A", help="Existing deployed ledger key ID to authenticate initial deployment")
 ):
     """Register a target server host entry and deploy all active hardware keys to it."""
     ledger = load_ledger()
@@ -916,6 +954,14 @@ def register_host(
         raise typer.Exit(1)
 
     host_alias = alias if alias else hostname
+    if bastion:
+        if not find_host(ledger, bastion):
+            console.print(f"[bold red]Bastion host '{bastion}' is not registered in the ledger.[/bold red]")
+            raise typer.Exit(1)
+        if bastion in {host_alias, hostname}:
+            console.print("[bold red]A host cannot use itself as its bastion.[/bold red]")
+            raise typer.Exit(1)
+
     host_info = {
         "alias": host_alias,
         "hostname": hostname,
@@ -923,9 +969,21 @@ def register_host(
         "port": port,
         "deployed_keys": list(ledger["keys"].keys())
     }
+    if bastion:
+        host_info["bastion"] = bastion
     keys_to_deploy = [(k_alias, k_info["public_key"]) for k_alias, k_info in ledger["keys"].items()]
 
-    success = update_remote_authorized_keys(host_info, keys_to_add=keys_to_deploy, keys_to_remove_aliases=[])
+    if auth_key or bastion:
+        selected_auth_key = choose_rollout_auth_key(ledger, [], auth_key)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                identity_file = extract_resident_identity_file(selected_auth_key, ledger, Path(tmpdir)) if selected_auth_key else None
+            except RuntimeError as e:
+                console.print(f"[bold red]{e}[/bold red]")
+                raise typer.Exit(1)
+            success = update_remote_authorized_keys(host_info, keys_to_add=keys_to_deploy, keys_to_remove_aliases=[], identity_file=identity_file, ledger=ledger)
+    else:
+        success = update_remote_authorized_keys(host_info, keys_to_add=keys_to_deploy, keys_to_remove_aliases=[])
     
     if success:
         hosts = ledger.setdefault("hosts", [])
@@ -958,17 +1016,34 @@ def scan_host_keys(
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
-        console.print(f"[bold blue]Connecting to {user}@{hostname}:{port}...[/bold blue]")
-        client.connect(hostname=hostname, port=port, username=user, timeout=10)
-        sftp = client.open_sftp()
+        if matching_host.get("bastion"):
+            jump_arg = bastion_jump_arg(ledger, matching_host)
+            console.print(f"[bold blue]Connecting to {user}@{hostname}:{port} via {jump_arg}...[/bold blue]")
+            read_res = subprocess.run(
+                [
+                    "ssh",
+                    "-J", jump_arg,
+                    "-p", str(port),
+                    f"{user}@{hostname}",
+                    "test -f .ssh/authorized_keys && cat .ssh/authorized_keys || true"
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+                check=True,
+                env=GitEncryptedLedger._get_env()
+            )
+            existing_lines = [line.strip() for line in read_res.stdout.splitlines() if line.strip()]
+        else:
+            console.print(f"[bold blue]Connecting to {user}@{hostname}:{port}...[/bold blue]")
+            client.connect(hostname=hostname, port=port, username=user, timeout=10)
+            sftp = client.open_sftp()
 
-        auth_keys_path = ".ssh/authorized_keys"
-        existing_lines = []
-        with sftp.open(auth_keys_path, "r") as f:
-            existing_lines = [line.strip() for line in f.readlines() if line.strip()]
+            auth_keys_path = ".ssh/authorized_keys"
+            with sftp.open(auth_keys_path, "r") as f:
+                existing_lines = [line.strip() for line in f.readlines() if line.strip()]
 
-        sftp.close()
-        client.close()
+            sftp.close()
+            client.close()
 
         table = Table(title=f"Remote State Inspection: {user}@{hostname}")
         table.add_column("Key Line Excerpt", style="cyan")
@@ -1006,6 +1081,7 @@ def list_hosts():
     table.add_column("Hostname / IP", style="magenta")
     table.add_column("User", style="yellow")
     table.add_column("Port", style="blue")
+    table.add_column("Bastion", style="cyan")
     table.add_column("Deployed Key Aliases", style="green")
 
     for host_info in hosts:
@@ -1015,10 +1091,53 @@ def list_hosts():
             host_info.get("hostname", "N/A"),
             host_info.get("user", "N/A"),
             str(host_info.get("port", 22)),
+            host_info.get("bastion", "None"),
             deployed_keys
         )
 
     console.print(table)
+
+@host_app.command("set-bastion")
+def set_host_bastion(
+    alias_or_host: str = typer.Argument(..., help="Host alias or hostname to route through a bastion"),
+    bastion: str = typer.Argument(..., help="Registered ledger host alias/hostname to use as bastion"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Specific user entry to target if multiple exist")
+):
+    """Set a registered host to connect through another registered host as bastion."""
+    ledger = load_ledger()
+    target_host = find_host(ledger, alias_or_host, user=user)
+    bastion_host = find_host(ledger, bastion)
+
+    if not target_host:
+        console.print(f"[bold red]Host entry '{alias_or_host}' not found in ledger.[/bold red]")
+        raise typer.Exit(1)
+    if not bastion_host:
+        console.print(f"[bold red]Bastion host '{bastion}' not found in ledger.[/bold red]")
+        raise typer.Exit(1)
+    if target_host is bastion_host:
+        console.print("[bold red]A host cannot use itself as its bastion.[/bold red]")
+        raise typer.Exit(1)
+
+    target_host["bastion"] = bastion_host.get("alias", bastion_host["hostname"])
+    save_ledger(ledger, action=f"Set bastion for {host_label(target_host)}")
+    console.print(f"[bold green]✔ Set bastion for {host_label(target_host)} to {host_label(bastion_host)}.[/bold green]")
+
+@host_app.command("clear-bastion")
+def clear_host_bastion(
+    alias_or_host: str = typer.Argument(..., help="Host alias or hostname whose bastion should be cleared"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Specific user entry to target if multiple exist")
+):
+    """Remove bastion routing metadata from a registered host."""
+    ledger = load_ledger()
+    target_host = find_host(ledger, alias_or_host, user=user)
+
+    if not target_host:
+        console.print(f"[bold red]Host entry '{alias_or_host}' not found in ledger.[/bold red]")
+        raise typer.Exit(1)
+
+    target_host.pop("bastion", None)
+    save_ledger(ledger, action=f"Clear bastion for {host_label(target_host)}")
+    console.print(f"[bold green]✔ Cleared bastion for {host_label(target_host)}.[/bold green]")
 
 @host_app.command("remove")
 def remove_host(
@@ -1379,7 +1498,8 @@ def rotate_key(
             success = update_remote_authorized_keys(
                 host_info,
                 keys_to_add=[(new_key_id, new_pubkey.strip())],
-                keys_to_remove_aliases=[old_key_id]
+                keys_to_remove_aliases=[old_key_id],
+                ledger=ledger
             )
             if success:
                 host_info["deployed_keys"].remove(old_key_id)
@@ -1410,7 +1530,8 @@ def revoke_key(
             success = update_remote_authorized_keys(
                 host_info, 
                 keys_to_add=[], 
-                keys_to_remove_aliases=[key_id]
+                keys_to_remove_aliases=[key_id],
+                ledger=ledger
             )
             if success:
                 host_info["deployed_keys"].remove(key_id)
@@ -1714,6 +1835,71 @@ def show_git_remotes():
             table.add_row(parts[0], parts[1])
 
     console.print(table)
+
+SIGNATURE_STATUS = {
+    "G": ("Good", "green"),
+    "U": ("Good (unknown trust)", "yellow"),
+    "X": ("Good (expired key)", "yellow"),
+    "Y": ("Good (expired signer)", "yellow"),
+    "R": ("Good (revoked key)", "red"),
+    "B": ("BAD", "bold red"),
+    "E": ("Unverifiable", "yellow"),
+    "N": ("Unsigned", "red"),
+}
+
+@git_app.command("log")
+def show_git_log(
+    limit: int = typer.Option(20, "--limit", "-n", min=1, help="Number of ledger operations to display."),
+    sync: bool = typer.Option(False, "--sync", "-s", help="Fetch the latest ledger history from the remote first."),
+):
+    """Show the most recent ledger operations and who performed them."""
+    if not (REPO_DIR / ".git").exists():
+        console.print("[bold yellow]No local Git repository initialized.[/bold yellow]")
+        return
+
+    env = GitEncryptedLedger._get_env()
+
+    if sync:
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            cwd=REPO_DIR, capture_output=True, text=True, env=env
+        )
+        if fetch.returncode != 0:
+            console.print(f"[dim yellow]Notice: Git fetch skipped/failed: {fetch.stderr.strip()}[/dim yellow]")
+
+    sep = "\x1f"
+    fields = ["%h", "%ad", "%an", "%ae", "%G?", "%GS", "%s"]
+    res = subprocess.run(
+        ["git", "log", f"--max-count={limit}", "--date=iso-local",
+         f"--pretty=format:{sep.join(fields)}"],
+        cwd=REPO_DIR, capture_output=True, text=True, env=env
+    )
+
+    if res.returncode != 0 or not res.stdout.strip():
+        console.print("[bold yellow]No ledger operations recorded yet.[/bold yellow]")
+        return
+
+    table = Table(title="Ledger Operation History")
+    table.add_column("Commit", style="cyan", no_wrap=True)
+    table.add_column("Date", style="dim", no_wrap=True)
+    table.add_column("Operation", style="white")
+    table.add_column("Performed By", style="magenta")
+    table.add_column("Signature", no_wrap=True)
+
+    for line in res.stdout.splitlines():
+        parts = line.split(sep)
+        if len(parts) != len(fields):
+            continue
+        commit, date, author, email, sig_code, signer, subject = parts
+
+        label, colour = SIGNATURE_STATUS.get(sig_code, ("Unknown", "yellow"))
+        if signer.strip():
+            label = f"{label} — {signer.strip()}"
+
+        table.add_row(commit, date, subject, f"{author} <{email}>", f"[{colour}]{label}[/{colour}]")
+
+    console.print(table)
+    console.print("[dim]Signatures are only meaningful if gpg.ssh.allowedSignersFile lists the trusted signers.[/dim]")
 
 if __name__ == "__main__":
     app()
