@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
+import base64
+import struct
 import yaml
 import tempfile
 import subprocess
@@ -12,6 +14,9 @@ import paramiko
 from rich.console import Console
 from rich.table import Table
 from fido2.hid import CtapHidDevice
+from fido2.ctap import CtapError
+from fido2.ctap2 import Ctap2, ClientPin
+from fido2.ctap2.credman import CredentialManagement
 
 app = typer.Typer(help="Hardware SSH Key Ledger & Remote Manager")
 console = Console()
@@ -267,12 +272,269 @@ def parse_authorized_keys_line(line: str) -> Tuple[str, Optional[str]]:
             
     return line, managed_alias
 
+def public_key_identity(pubkey: str) -> str:
+    """Return the stable key type and blob, ignoring mutable comments/tags."""
+    return " ".join(pubkey.strip().split()[:2])
+
+def ssh_wire_string(value: bytes) -> bytes:
+    return struct.pack(">I", len(value)) + value
+
+def openssh_sk_ed25519_public_key(public_key: dict, application: str) -> Optional[str]:
+    if public_key.get(3) not in (-8, -19) or public_key.get(-1) != 6:
+        return None
+
+    key_material = public_key.get(-2)
+    if not isinstance(key_material, bytes) or len(key_material) != 32:
+        return None
+
+    key_type = b"sk-ssh-ed25519@openssh.com"
+    key_blob = b"".join([
+        ssh_wire_string(key_type),
+        ssh_wire_string(key_material),
+        ssh_wire_string(application.encode()),
+    ])
+    return f"{key_type.decode()} {base64.b64encode(key_blob).decode()}"
+
+def read_attached_resident_keys_via_fido2() -> List[Dict[str, str]]:
+    """Enumerate SSH resident credentials using CTAP credential management."""
+    discovered_keys = []
+
+    devices = list(CtapHidDevice.list_devices())
+    if not devices:
+        return discovered_keys
+
+    pin = typer.prompt("Enter FIDO PIN for credential enumeration", hide_input=True)
+
+    for device_index, device in enumerate(devices, start=1):
+        with device:
+            ctap = Ctap2(device)
+            if not CredentialManagement.is_supported(ctap.info):
+                console.print(f"[dim yellow]Device {device_index} does not support credential management enumeration.[/dim yellow]")
+                continue
+
+            client_pin = ClientPin(ctap)
+            try:
+                pin_token = client_pin.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT)
+            except CtapError as e:
+                if e.code == CtapError.ERR.PIN_NOT_SET:
+                    raise RuntimeError(
+                        "FIDO2 PIN is not set on this hardware key. Other YubiKey PINs "
+                        "(PIV, OpenPGP, OATH/Yubico Authenticator) do not unlock FIDO2 "
+                        "resident SSH credential enumeration. Set it with: ykman fido access change-pin"
+                    ) from e
+                raise
+            credman = CredentialManagement(ctap, client_pin.protocol, pin_token)
+
+            for relying_party in credman.enumerate_rps():
+                rp = relying_party.get(CredentialManagement.RESULT.RP, {})
+                application = rp.get("id", "")
+                if not application.startswith("ssh:"):
+                    continue
+
+                rp_id_hash = relying_party.get(CredentialManagement.RESULT.RP_ID_HASH)
+                if not rp_id_hash:
+                    continue
+
+                for credential in credman.enumerate_creds(rp_id_hash):
+                    public_key = credential.get(CredentialManagement.RESULT.PUBLIC_KEY)
+                    pubkey = openssh_sk_ed25519_public_key(public_key, application) if public_key else None
+                    if not pubkey:
+                        continue
+
+                    user = credential.get(CredentialManagement.RESULT.USER, {})
+                    file_name = user.get("name") or user.get("displayName") or f"device_{device_index}_ssh_key"
+                    discovered_keys.append({
+                        "file_name": f"{file_name}.pub",
+                        "public_key": pubkey,
+                        "identity": public_key_identity(pubkey)
+                    })
+
+    return discovered_keys
+
+def read_attached_resident_keys() -> List[Dict[str, str]]:
+    """Extract resident SSH public keys from attached hardware tokens."""
+    discovered_keys = []
+    ssh_keygen_error = None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            subprocess.run(
+                ["ssh-keygen", "-K", "-N", ""],
+                cwd=tmpdir,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=GitEncryptedLedger._get_env()
+            )
+        except subprocess.CalledProcessError as e:
+            ssh_keygen_error = e.stderr.strip() or "ssh-keygen failed to read resident keys"
+        else:
+            for key_file in Path(tmpdir).glob("*.pub"):
+                with open(key_file, "r") as f:
+                    public_key = f.read().strip()
+                discovered_keys.append({
+                    "file_name": key_file.name,
+                    "public_key": public_key,
+                    "identity": public_key_identity(public_key)
+                })
+
+    if discovered_keys:
+        return discovered_keys
+
+    try:
+        fallback_keys = read_attached_resident_keys_via_fido2()
+    except Exception as e:
+        fallback_error = str(e)
+        if ssh_keygen_error:
+            raise RuntimeError(f"ssh-keygen failed: {ssh_keygen_error}; FIDO2 fallback failed: {fallback_error}") from e
+        raise RuntimeError(f"FIDO2 fallback failed: {fallback_error}") from e
+
+    if fallback_keys:
+        if ssh_keygen_error:
+            console.print(f"[dim yellow]ssh-keygen resident-key download failed, used FIDO2 credential enumeration instead: {ssh_keygen_error}[/dim yellow]")
+        return fallback_keys
+
+    if ssh_keygen_error:
+        raise RuntimeError(ssh_keygen_error)
+
+    return []
+
+def extract_resident_identity_file(key_alias: str, ledger: dict, output_dir: Path) -> Path:
+    """Extract the resident private-key stub matching a ledger key alias."""
+    key_info = ledger.get("keys", {}).get(key_alias)
+    if not key_info:
+        raise RuntimeError(f"Key '{key_alias}' is not registered in the ledger")
+
+    target_identity = public_key_identity(key_info.get("public_key", ""))
+    if not target_identity:
+        raise RuntimeError(f"Key '{key_alias}' has no usable public key in the ledger")
+
+    try:
+        subprocess.run(
+            ["ssh-keygen", "-K", "-N", ""],
+            cwd=output_dir,
+            check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Could not extract resident key stubs from active hardware key: {e}") from e
+
+    for pub_path in output_dir.glob("*.pub"):
+        with open(pub_path, "r") as f:
+            if public_key_identity(f.read()) == target_identity:
+                return pub_path.with_suffix("")
+
+    raise RuntimeError(f"Resident key '{key_alias}' was not found on the plugged-in hardware key")
+
+def choose_rollout_auth_key(ledger: dict, keys_to_deploy: List[Tuple[str, str]], auth_key_id: Optional[str]) -> Optional[str]:
+    """Select an already deployed ledger key for authenticating rollout."""
+    hosts = ledger.get("hosts", [])
+    if not hosts:
+        return None
+
+    if auth_key_id:
+        if auth_key_id not in ledger.get("keys", {}):
+            console.print(f"[bold red]Authentication key '{auth_key_id}' is not registered in the ledger.[/bold red]")
+            raise typer.Exit(1)
+        return auth_key_id
+
+    new_key_aliases = {key_alias for key_alias, _ in keys_to_deploy}
+    candidates = [
+        key_alias
+        for key_alias in ledger.get("keys", {})
+        if key_alias not in new_key_aliases
+        and any(key_alias in host.get("deployed_keys", []) for host in hosts)
+    ]
+
+    if not candidates:
+        console.print("[dim yellow]No already-deployed ledger key is available for rollout authentication. Falling back to default SSH auth.[/dim yellow]")
+        return None
+
+    console.print("[bold blue]Plug in the active hardware key used for existing server access.[/bold blue]")
+    console.print(f"[dim]Available rollout authentication key IDs: {', '.join(candidates)}[/dim]")
+    selected = typer.prompt("Ledger key ID to authenticate rollout", default=candidates[0]).strip()
+    if selected not in ledger.get("keys", {}):
+        console.print(f"[bold red]Authentication key '{selected}' is not registered in the ledger.[/bold red]")
+        raise typer.Exit(1)
+
+    return selected
+
+def update_remote_authorized_keys_via_openssh(
+    host_info: dict,
+    keys_to_add: List[Tuple[str, str]],
+    keys_to_remove_aliases: List[str],
+    identity_file: Path
+) -> bool:
+    """Update authorized_keys through OpenSSH so FIDO-backed identities work."""
+    hostname = host_info["hostname"]
+    port = host_info.get("port", 22)
+    user = host_info.get("user", os.getlogin())
+    target = f"{user}@{hostname}"
+    ssh_cmd = [
+        "ssh",
+        "-i", str(identity_file),
+        "-o", "IdentitiesOnly=yes",
+        "-p", str(port),
+        target
+    ]
+
+    try:
+        console.print(f"[bold blue]Connecting to {target}:{port} using {identity_file.name}...[/bold blue]")
+        read_res = subprocess.run(
+            ssh_cmd + ["test -f .ssh/authorized_keys && cat .ssh/authorized_keys || true"],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+
+        retained_lines = []
+        for line in read_res.stdout.splitlines():
+            raw_line, managed_alias = parse_authorized_keys_line(line)
+            if managed_alias and managed_alias in keys_to_remove_aliases:
+                continue
+            if raw_line:
+                retained_lines.append(raw_line)
+
+        for key_alias, key_pubkey in keys_to_add:
+            formatted = format_managed_key_line(key_pubkey, key_alias)
+            retained_lines = [
+                line for line in retained_lines
+                if parse_authorized_keys_line(line)[1] != key_alias
+            ]
+            retained_lines.append(formatted)
+
+        new_content = "\n".join(retained_lines) + "\n"
+        write_script = "umask 077; mkdir -p .ssh; tmp=.ssh/authorized_keys.tmp.$$; cat > \"$tmp\" && chmod 600 \"$tmp\" && mv \"$tmp\" .ssh/authorized_keys"
+        subprocess.run(
+            ssh_cmd + [write_script],
+            input=new_content,
+            text=True,
+            check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+
+        console.print(f"[bold green]✔ Successfully updated keys on {hostname}[/bold green]")
+        return True
+    except Exception as e:
+        console.print(f"[bold red]✖ Failed on {hostname}: {e}[/bold red]")
+        return False
+
 def update_remote_authorized_keys(
     host_info: dict, 
     keys_to_add: List[Tuple[str, str]],  # List of (key_alias, pubkey)
-    keys_to_remove_aliases: List[str]
+    keys_to_remove_aliases: List[str],
+    identity_file: Optional[Path] = None
 ) -> bool:
     """Connects via Paramiko SFTP and updates ~/.ssh/authorized_keys safely with key tags."""
+    if identity_file:
+        return update_remote_authorized_keys_via_openssh(
+            host_info,
+            keys_to_add=keys_to_add,
+            keys_to_remove_aliases=keys_to_remove_aliases,
+            identity_file=identity_file
+        )
+
     hostname = host_info["hostname"]
     port = host_info.get("port", 22)
     user = host_info.get("user", os.getlogin())
@@ -330,6 +592,63 @@ def update_remote_authorized_keys(
     except Exception as e:
         console.print(f"[bold red]✖ Failed on {hostname}: {e}[/bold red]")
         return False
+
+def deploy_keys_to_registered_hosts(
+    ledger: dict,
+    keys_to_deploy: List[Tuple[str, str]],
+    auth_key_id: Optional[str] = None
+) -> List[str]:
+    """Deploy newly registered keys to every host already tracked in the ledger."""
+    failed_hosts = []
+    selected_auth_key = choose_rollout_auth_key(ledger, keys_to_deploy, auth_key_id)
+
+    if selected_auth_key:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                identity_file = extract_resident_identity_file(selected_auth_key, ledger, Path(tmpdir))
+            except RuntimeError as e:
+                console.print(f"[bold red]{e}[/bold red]")
+                raise typer.Exit(1)
+
+            for host_info in ledger.get("hosts", []):
+                if selected_auth_key not in host_info.get("deployed_keys", []):
+                    console.print(
+                        f"[dim yellow]Notice: auth key '{selected_auth_key}' is not marked deployed on "
+                        f"{host_info.get('alias', host_info.get('hostname', 'unknown'))}; attempting anyway.[/dim yellow]"
+                    )
+                success = update_remote_authorized_keys(
+                    host_info,
+                    keys_to_add=keys_to_deploy,
+                    keys_to_remove_aliases=[],
+                    identity_file=identity_file
+                )
+                host_alias = host_info.get("alias", host_info.get("hostname", "unknown"))
+                if success:
+                    deployed_keys = host_info.setdefault("deployed_keys", [])
+                    for key_alias, _ in keys_to_deploy:
+                        if key_alias not in deployed_keys:
+                            deployed_keys.append(key_alias)
+                else:
+                    failed_hosts.append(host_alias)
+
+        return failed_hosts
+
+    for host_info in ledger.get("hosts", []):
+        success = update_remote_authorized_keys(
+            host_info,
+            keys_to_add=keys_to_deploy,
+            keys_to_remove_aliases=[]
+        )
+        host_alias = host_info.get("alias", host_info.get("hostname", "unknown"))
+        if success:
+            deployed_keys = host_info.setdefault("deployed_keys", [])
+            for key_alias, _ in keys_to_deploy:
+                if key_alias not in deployed_keys:
+                    deployed_keys.append(key_alias)
+        else:
+            failed_hosts.append(host_alias)
+
+    return failed_hosts
 
 # ----------------------------------------------------------------------
 # Root Operations
@@ -601,18 +920,24 @@ def remove_host(
 @key_app.command("add")
 def register_key(
     key_id: str = typer.Argument(..., help="Identifier for the key (e.g. yubi_primary)"),
-    pubkey: str = typer.Argument(..., help="The SSH public key string")
+    pubkey: str = typer.Argument(..., help="The SSH public key string"),
+    auth_key: Optional[str] = typer.Option(None, "--auth-key", "-A", help="Existing deployed ledger key ID to authenticate rollout")
 ):
     """Manually register an existing hardware SSH key into the ledger."""
     ledger = load_ledger()
-    ledger["keys"][key_id] = {"public_key": pubkey.strip()}
+    clean_pubkey = pubkey.strip()
+    ledger["keys"][key_id] = {"public_key": clean_pubkey}
+    failed_hosts = deploy_keys_to_registered_hosts(ledger, [(key_id, clean_pubkey)], auth_key_id=auth_key)
     save_ledger(ledger, action=f"Register key {key_id}")
+    if failed_hosts:
+        console.print(f"[bold yellow]Registered key, but could not deploy it to: {', '.join(failed_hosts)}[/bold yellow]")
     console.print(f"[bold green]Registered hardware key '{key_id}' into encrypted ledger.[/bold green]")
 
 @key_app.command("enroll")
 def enroll_key(
     key_id: str = typer.Option(None, "--id", "-i", help="Unique ledger identifier for the new key"),
-    application: str = typer.Option("hwkey", "--application", "-a", help="Key comment/application tag")
+    application: str = typer.Option("hwkey", "--application", "-a", help="Key comment/application tag"),
+    auth_key: Optional[str] = typer.Option(None, "--auth-key", "-A", help="Existing deployed ledger key ID to authenticate rollout")
 ):
 
     ensure_yubikey_pin()
@@ -633,6 +958,8 @@ def enroll_key(
             subprocess.run([
                 "ssh-keygen", "-t", "ed25519-sk",
                 "-O", "resident",
+                "-O", "verify-required",
+                "-N", "",
                 "-C", f"{alias} ({application})",
                 "-f", str(key_path)
             ], check=True, env=GitEncryptedLedger._get_env())
@@ -645,7 +972,10 @@ def enroll_key(
             raise typer.Exit(1)
 
     ledger["keys"][alias] = {"public_key": pubkey}
+    failed_hosts = deploy_keys_to_registered_hosts(ledger, [(alias, pubkey)], auth_key_id=auth_key)
     save_ledger(ledger, action=f"Enroll resident key {alias}")
+    if failed_hosts:
+        console.print(f"[bold yellow]Created and registered key, but could not deploy it to: {', '.join(failed_hosts)}[/bold yellow]")
     console.print(f"[bold green]✔ Successfully created resident key on hardware and registered '{alias}' in ledger![/bold green]")
 
 @key_app.command("stub")
@@ -682,7 +1012,9 @@ def generate_stubs(
         raise typer.Exit(1)
 
 @key_app.command("scan")
-def scan_keys():
+def scan_keys(
+    auth_key: Optional[str] = typer.Option(None, "--auth-key", "-A", help="Existing deployed ledger key ID to authenticate rollout")
+):
     """Scan attached YubiKeys, check registration status in ledger, and sync hardware resident keys."""
     console.print("[bold blue]Scanning USB bus for physical hardware keys...[/bold blue]")
 
@@ -754,10 +1086,15 @@ def scan_keys():
         return
 
     updated = False
+    keys_to_deploy = []
 
     for item in discovered_keys:
         pub = item["public_key"]
-        existing_alias = next((k for k, v in ledger.get("keys", {}).items() if v.get("public_key") == pub), None)
+        pub_identity = public_key_identity(pub)
+        existing_alias = next(
+            (k for k, v in ledger.get("keys", {}).items() if public_key_identity(v.get("public_key", "")) == pub_identity),
+            None
+        )
 
         if existing_alias:
             console.print(f"[dim green]  ✔ Resident key already registered in ledger under alias: '{existing_alias}'[/dim green]")
@@ -765,10 +1102,89 @@ def scan_keys():
             auto_alias = typer.prompt(f"Found unregistered resident key ({pub[:15]}...). Enter alias", default=f"yubi_key_{len(ledger.get('keys', {})) + 1}")
             ledger["keys"][auto_alias] = {"public_key": pub}
             console.print(f"[bold green]✔ Enrolled '{auto_alias}' into ledger[/bold green]")
+            keys_to_deploy.append((auto_alias, pub))
             updated = True
 
     if updated:
+        failed_hosts = deploy_keys_to_registered_hosts(ledger, keys_to_deploy, auth_key_id=auth_key)
         save_ledger(ledger, action="Scan & sync attached hardware keys")
+        if failed_hosts:
+            console.print(f"[bold yellow]Synced keys, but could not deploy them to: {', '.join(failed_hosts)}[/bold yellow]")
+
+@key_app.command("verify")
+def verify_attached_keys():
+    """Verify attached resident SSH keys against the encrypted ledger."""
+    ledger = load_ledger()
+    ledger_keys = ledger.get("keys", {})
+    ledger_by_identity = {
+        public_key_identity(key_info.get("public_key", "")): key_alias
+        for key_alias, key_info in ledger_keys.items()
+        if key_info.get("public_key")
+    }
+
+    serials = []
+    try:
+        res = subprocess.run(
+            ["ykman", "list", "--serials"],
+            capture_output=True, text=True, check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+        serials = [s.strip() for s in res.stdout.splitlines() if s.strip()]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    devices = list(CtapHidDevice.list_devices())
+    console.print(f"[bold cyan]Detected {len(devices)} FIDO2 device(s) and {len(serials)} YubiKey serial(s).[/bold cyan]")
+
+    try:
+        attached_keys = read_attached_resident_keys()
+    except RuntimeError as e:
+        console.print(f"[bold red]Could not read resident SSH keys from attached token(s): {e}[/bold red]")
+        raise typer.Exit(1)
+
+    attached_by_identity = {item["identity"]: item for item in attached_keys}
+
+    table = Table(title="Attached Hardware Key Verification")
+    table.add_column("Ledger Alias", style="cyan")
+    table.add_column("Token Status", style="magenta")
+    table.add_column("Deployment Status", style="green")
+    table.add_column("Hosts", style="yellow")
+
+    for key_alias, key_info in ledger_keys.items():
+        identity = public_key_identity(key_info.get("public_key", ""))
+        token_status = "[green]present[/green]" if identity in attached_by_identity else "[red]missing[/red]"
+        deployed_hosts = [
+            f"{host.get('user')}@{host.get('alias', host.get('hostname'))}"
+            for host in ledger.get("hosts", [])
+            if key_alias in host.get("deployed_keys", [])
+        ]
+        host_count = len(ledger.get("hosts", []))
+        deployment_status = f"{len(deployed_hosts)}/{host_count} hosts" if host_count else "no hosts"
+        table.add_row(
+            key_alias,
+            token_status,
+            deployment_status,
+            ", ".join(deployed_hosts) if deployed_hosts else "None"
+        )
+
+    console.print(table)
+
+    unregistered = [
+        item for item in attached_keys
+        if item["identity"] not in ledger_by_identity
+    ]
+    if unregistered:
+        extra_table = Table(title="Resident Keys Not Registered In Ledger")
+        extra_table.add_column("Extracted Stub", style="cyan")
+        extra_table.add_column("Public Key Excerpt", style="magenta")
+        for item in unregistered:
+            pubkey = item["public_key"]
+            excerpt = f"{pubkey[:30]}...{pubkey[-20:]}" if len(pubkey) > 55 else pubkey
+            extra_table.add_row(item["file_name"], excerpt)
+        console.print(extra_table)
+
+    if not attached_keys:
+        console.print("[bold yellow]No resident SSH keys were found on attached hardware token(s).[/bold yellow]")
 
 @key_app.command("list")
 def list_keys():

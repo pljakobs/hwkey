@@ -193,10 +193,11 @@ hwkey ssh web-prod
 
 | Command | Description |
 | :--- | :--- |
-| `hwkey key scan` | Scans USB bus for FIDO2 YubiKeys and syncs existing resident keys into the ledger without passphrase prompts. |
-| `hwkey key enroll [-i <id>] [-a <app>]` | Generates a brand-new resident SSH key (`ed25519-sk`) on the YubiKey and records it in the ledger. |
+| `hwkey key scan [-A <auth_key>]` | Scans USB bus for FIDO2 YubiKeys and syncs existing resident keys into the ledger without passphrase prompts. |
+| `hwkey key enroll [-i <id>] [-a <app>] [-A <auth_key>]` | Generates a brand-new resident SSH key (`ed25519-sk`) on the YubiKey, records it, and deploys it using an existing active ledger key. |
 | `hwkey key stub [-o <out_dir>]` | Extracts resident key handles into local persistent SSH stub files (`~/.ssh/id_*_rk`). |
-| `hwkey key add <key_id> <pubkey>` | Manually adds an SSH public key string to the ledger. |
+| `hwkey key verify` | Reads plugged-in resident SSH keys, maps them to ledger aliases, and reports token/deployment status. |
+| `hwkey key add [-A <auth_key>] <key_id> <pubkey>` | Manually adds an SSH public key string to the ledger and deploys it using an existing active ledger key. |
 | `hwkey key list` | Displays a formatted table of all enrolled keys and the hosts they are deployed to. |
 | `hwkey key rotate <old_id> <new_id> <new_pubkey>` | Swaps an old key for a new key across all hosts holding the old key. |
 | `hwkey key revoke <key_id>` | Connects to all servers holding `<key_id>`, removes it from `authorized_keys`, and updates ledger. |
