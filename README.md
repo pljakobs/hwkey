@@ -180,6 +180,7 @@ hwkey ssh web-prod
 | :--- | :--- |
 | `hwkey init [-g <git_url>]` | Provisions local Age keys, writes `.sops.yaml`, initializes Git repo, and attaches optional remote URL. |
 | `hwkey ssh <target> [-k <key>] [-u <user>] [-p <port>]` | Interactive SSH wrapper that extracts temporary key stubs and logs into `<target>`. |
+| `hwkey version` | Shows the local hwkey utility version and supported ledger schema version. |
 
 ### Host Domain (`hwkey host`)
 
@@ -197,6 +198,7 @@ hwkey ssh web-prod
 | `hwkey key enroll [-i <id>] [-a <app>] [-A <auth_key>]` | Generates a brand-new resident SSH key (`ed25519-sk`) on the YubiKey, records it, and deploys it using an existing active ledger key. |
 | `hwkey key stub [-o <out_dir>]` | Extracts resident key handles into local persistent SSH stub files (`~/.ssh/id_*_rk`). |
 | `hwkey key verify` | Reads plugged-in resident SSH keys, maps them to ledger aliases, and reports token/deployment status. |
+| `hwkey key resync [-k <key_id>] [-A <auth_key>]` | Repairs incomplete deployments by pushing missing ledger keys to hosts that do not list them as deployed. |
 | `hwkey key add [-A <auth_key>] <key_id> <pubkey>` | Manually adds an SSH public key string to the ledger and deploys it using an existing active ledger key. |
 | `hwkey key list` | Displays a formatted table of all enrolled keys and the hosts they are deployed to. |
 | `hwkey key rotate <old_id> <new_id> <new_pubkey>` | Swaps an old key for a new key across all hosts holding the old key. |
@@ -234,6 +236,16 @@ hwkey ssh web-prod
 * `~/.hwkey/repo/.sops.yaml` — SOPS recipient configuration and file-matching regex.
 * `~/.hwkey/repo/ledger.enc.yaml` — Decrypted in-memory, stored encrypted on disk and in Git.
 * `~/.config/sops/age/keys.txt` — Active local private Age decryption key.
+
+## Ledger Compatibility
+
+Each saved ledger records the hwkey version that last wrote it, the ledger schema version, and the minimum hwkey version required to read it safely. If a future hwkey release updates the ledger in a way that requires newer functionality, older compatible clients will stop with an update-required message instead of silently operating on mismatched state.
+
+Check the installed tool version with:
+
+```bash
+hwkey version
+```
 
 # Existing Alternatives
 

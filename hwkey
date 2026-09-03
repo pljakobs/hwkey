@@ -18,6 +18,10 @@ from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2, ClientPin
 from fido2.ctap2.credman import CredentialManagement
 
+HWKEY_VERSION = "0.2.0"
+LEDGER_SCHEMA_VERSION = 1
+MIN_LEDGER_HWKEY_VERSION = "0.2.0"
+
 app = typer.Typer(help="Hardware SSH Key Ledger & Remote Manager")
 console = Console()
 
@@ -37,6 +41,52 @@ REPO_DIR = Path.home() / ".hwkey" / "repo"
 LEDGER_PATH = REPO_DIR / "ledger.enc.yaml"
 
 ENV_PATH = f"{Path.home()}/go/bin:{Path.home()}/.local/bin:{os.environ.get('PATH', '')}"
+
+def default_ledger() -> dict:
+    return {
+        "_hwkey": {
+            "ledger_schema_version": LEDGER_SCHEMA_VERSION,
+            "min_hwkey_version": MIN_LEDGER_HWKEY_VERSION,
+            "last_writer_version": HWKEY_VERSION
+        },
+        "keys": {},
+        "hosts": []
+    }
+
+def parse_version(version: str) -> Tuple[int, int, int]:
+    parts = version.split(".")
+    parsed = []
+    for part in parts[:3]:
+        number = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            number += char
+        parsed.append(int(number or 0))
+
+    while len(parsed) < 3:
+        parsed.append(0)
+
+    return tuple(parsed)
+
+def ensure_ledger_metadata(data: dict) -> dict:
+    metadata = data.setdefault("_hwkey", {})
+    metadata.setdefault("ledger_schema_version", LEDGER_SCHEMA_VERSION)
+    metadata.setdefault("min_hwkey_version", MIN_LEDGER_HWKEY_VERSION)
+    metadata["last_writer_version"] = HWKEY_VERSION
+    return data
+
+def check_ledger_compatibility(data: dict):
+    metadata = data.get("_hwkey", {})
+    min_version = metadata.get("min_hwkey_version")
+    if min_version and parse_version(HWKEY_VERSION) < parse_version(str(min_version)):
+        last_writer = metadata.get("last_writer_version", "a newer hwkey release")
+        console.print(
+            f"[bold red]This ledger requires hwkey >= {min_version}, "
+            f"but this utility is {HWKEY_VERSION}.[/bold red]"
+        )
+        console.print(f"[yellow]The ledger was last updated by {last_writer}. Please update hwkey before continuing.[/yellow]")
+        raise typer.Exit(1)
 
 # ----------------------------------------------------------------------
 # Encrypted Git Ledger Engine
@@ -91,11 +141,11 @@ class GitEncryptedLedger:
         self.sync_pull()
         
         if not self.ledger_path.exists():
-            return {"keys": {}, "hosts": []}
+            return default_ledger()
 
         try:
             decrypted_yaml = self._run_cmd(["sops", "-d", str(self.ledger_path)])
-            data = yaml.safe_load(decrypted_yaml) or {"keys": {}, "hosts": []}
+            data = yaml.safe_load(decrypted_yaml) or default_ledger()
             
             # Compatibility layer: Ensure hosts internal data structure is a list
             if isinstance(data.get("hosts"), dict):
@@ -104,6 +154,10 @@ class GitEncryptedLedger:
                     hdata["alias"] = alias
                     migrated_hosts.append(hdata)
                 data["hosts"] = migrated_hosts
+
+            data.setdefault("keys", {})
+            data.setdefault("hosts", [])
+            check_ledger_compatibility(data)
 
             return data
         except Exception as e:
@@ -119,6 +173,7 @@ class GitEncryptedLedger:
             console.print("[bold yellow].sops.yaml missing. Initializing environment...[/bold yellow]")
             ensure_sops_config()
 
+        ensure_ledger_metadata(data)
         raw_yaml = yaml.dump(data, default_flow_style=False)
 
         process = subprocess.Popen(
@@ -650,9 +705,84 @@ def deploy_keys_to_registered_hosts(
 
     return failed_hosts
 
+def plan_missing_key_deployments(ledger: dict, key_id: Optional[str] = None) -> List[Tuple[dict, List[Tuple[str, str]]]]:
+    """Return the ledger keys missing from each registered host deployment record."""
+    ledger_keys = ledger.get("keys", {})
+    if key_id:
+        if key_id not in ledger_keys:
+            console.print(f"[bold red]Key '{key_id}' is not registered in the ledger.[/bold red]")
+            raise typer.Exit(1)
+        target_key_ids = [key_id]
+    else:
+        target_key_ids = list(ledger_keys.keys())
+
+    deployment_plan = []
+    for host_info in ledger.get("hosts", []):
+        deployed_keys = set(host_info.get("deployed_keys", []))
+        missing_keys = [
+            (target_key_id, ledger_keys[target_key_id]["public_key"])
+            for target_key_id in target_key_ids
+            if target_key_id not in deployed_keys
+        ]
+        if missing_keys:
+            deployment_plan.append((host_info, missing_keys))
+
+    return deployment_plan
+
+def resync_ledger_deployments(ledger: dict, key_id: Optional[str] = None, auth_key_id: Optional[str] = None) -> List[str]:
+    """Deploy ledger keys to hosts where their deployed_keys state is incomplete."""
+    deployment_plan = plan_missing_key_deployments(ledger, key_id=key_id)
+    if not deployment_plan:
+        console.print("[bold green]Ledger deployment state is already synchronized.[/bold green]")
+        return []
+
+    selected_auth_key = choose_rollout_auth_key(ledger, [], auth_key_id)
+    failed_hosts = []
+
+    def run_plan(identity_file: Optional[Path] = None):
+        for host_info, missing_keys in deployment_plan:
+            host_alias = host_info.get("alias", host_info.get("hostname", "unknown"))
+            missing_aliases = ", ".join(key_alias for key_alias, _ in missing_keys)
+            console.print(f"[bold blue]Resyncing {missing_aliases} to {host_alias}...[/bold blue]")
+            if selected_auth_key and selected_auth_key not in host_info.get("deployed_keys", []):
+                console.print(f"[dim yellow]Notice: auth key '{selected_auth_key}' is not marked deployed on {host_alias}; attempting anyway.[/dim yellow]")
+
+            success = update_remote_authorized_keys(
+                host_info,
+                keys_to_add=missing_keys,
+                keys_to_remove_aliases=[],
+                identity_file=identity_file
+            )
+            if success:
+                deployed_keys = host_info.setdefault("deployed_keys", [])
+                for key_alias, _ in missing_keys:
+                    if key_alias not in deployed_keys:
+                        deployed_keys.append(key_alias)
+            else:
+                failed_hosts.append(host_alias)
+
+    if selected_auth_key:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                identity_file = extract_resident_identity_file(selected_auth_key, ledger, Path(tmpdir))
+            except RuntimeError as e:
+                console.print(f"[bold red]{e}[/bold red]")
+                raise typer.Exit(1)
+            run_plan(identity_file=identity_file)
+    else:
+        run_plan()
+
+    return failed_hosts
+
 # ----------------------------------------------------------------------
 # Root Operations
 # ----------------------------------------------------------------------
+
+@app.command("version")
+def show_version():
+    """Show the hwkey utility and ledger schema version supported by this binary."""
+    console.print(f"hwkey {HWKEY_VERSION}")
+    console.print(f"ledger schema {LEDGER_SCHEMA_VERSION}")
 
 @app.command()
 def init(
@@ -1185,6 +1315,21 @@ def verify_attached_keys():
 
     if not attached_keys:
         console.print("[bold yellow]No resident SSH keys were found on attached hardware token(s).[/bold yellow]")
+
+@key_app.command("resync")
+def resync_keys(
+    key_id: Optional[str] = typer.Option(None, "--key", "-k", help="Only resync one ledger key ID"),
+    auth_key: Optional[str] = typer.Option(None, "--auth-key", "-A", help="Existing deployed ledger key ID to authenticate rollout")
+):
+    """Deploy ledger keys to hosts where deployment state is incomplete."""
+    ledger = load_ledger()
+    failed_hosts = resync_ledger_deployments(ledger, key_id=key_id, auth_key_id=auth_key)
+    save_ledger(ledger, action="Resync ledger key deployments")
+
+    if failed_hosts:
+        console.print(f"[bold yellow]Resync finished with unreachable or failed hosts: {', '.join(failed_hosts)}[/bold yellow]")
+    else:
+        console.print("[bold green]✔ Successfully resynced ledger key deployments.[/bold green]")
 
 @key_app.command("list")
 def list_keys():
