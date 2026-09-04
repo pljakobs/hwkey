@@ -3,3 +3,4 @@ paramiko>=3.4.0
 pyyaml>=6.0.1
 rich>=13.7.0
 fido2>=1.1.2
+keyring>=24.0.0

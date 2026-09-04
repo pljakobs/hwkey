@@ -222,6 +222,67 @@ hwkey ssh web-prod
 | `hwkey git set-remote <git_url>` | Configures or updates the origin remote Git repository URL. |
 | `hwkey git show-remotes` | Displays registered Git remotes configured for the ledger. |
 | `hwkey git log [-n <limit>] [-s]` | Shows the most recent ledger operations, who performed them, and their commit signature status. |
+| `hwkey git setup-signing [-k <pubkey>] [-e <email>] [--disable]` | Signs every ledger commit with a hardware-backed SSH key and records the trusted signer in the ledger. |
+
+### Session PIN Cache Domain (`hwkey pin`)
+
+Off by default. See **PIN Caching Trade-offs** below before enabling.
+
+| Command | Description |
+| :--- | :--- |
+| `hwkey pin policy <off\|session> [-w <age_pubkey>] [--default] [--ttl <min>]` | Sets which workstations may cache the PIN. Defaults to this workstation; `--default` sets the ledger-wide fallback. |
+| `hwkey pin unlock [--ttl <minutes>]` | Prompts once and caches the FIDO PIN for the session (default 10 minutes). |
+| `hwkey pin lock` | Purges the cached PIN immediately. |
+| `hwkey pin status` | Shows the policy per workstation and whether a PIN is currently cached. |
+
+---
+
+## PIN Caching Trade-offs
+
+> **Enabling `pin_cache` weakens the second factor. It is off by default and should stay off unless the convenience is worth the following.**
+
+With `session` caching enabled, the FIDO PIN is stored in your desktop keyring (GNOME Keyring / KWallet via the Secret Service API) with an expiry, and served to OpenSSH through an `SSH_ASKPASS` helper.
+
+What you keep:
+
+* Private key material remains non-extractable inside the token's secure element.
+* **Signing still requires a physical touch.** No cached state can satisfy the token's user-presence check.
+* A stolen token alone is still unusable, because the PIN stays on the workstation.
+
+What you lose:
+
+* **Any process running as your user can read the cached PIN.** Linux keyrings have no per-application access control.
+* **CTAP credential management requires no touch.** A leaked PIN allows an attacker to enumerate and *delete* your resident credentials.
+* **Silent touch-hijacking.** Malware holding the PIN can queue a signature request and ride your next legitimate touch without producing a visible prompt.
+
+Mitigations built in: the cache expires after 10 minutes by default, `hwkey pin lock` purges it on demand, the askpass helper refuses to answer anything other than a PIN prompt (so it can never leak the PIN into a host-key confirmation), and PIN variables are zeroed in memory after use. Unplugging the token when idle closes the window entirely.
+
+The policy is scoped to the **workstation**, identified by its Age recipient key — the same identity that authorizes ledger decryption. This is the scope that matters, because the PIN is stored on the workstation: where the policy is `off`, the PIN is never written to a keyring at all. Scoping by *target host* would be theatre, since one cached PIN is a single secret that any local process can read regardless of which host you later connect to.
+
+So you can permit caching on your trusted laptop while forbidding it on a shared or less-trusted machine, from either machine:
+
+```bash
+hwkey pin policy off --default          # nobody caches unless explicitly allowed
+hwkey pin policy session                # ...except this workstation
+hwkey pin policy off -w age1xyz...      # revoke it for another workstation
+hwkey pin unlock                        # cached for 10 minutes
+hwkey pin status                        # who may cache, and what is cached here
+```
+
+Because the policy lives in the encrypted ledger, revoking caching for a workstation propagates on its next sync. It does not purge a PIN already cached there — run `hwkey pin lock` on that machine, or wait for the TTL.
+
+---
+
+## Signed Ledger Commits
+
+Every ledger mutation is a Git commit. Signing them with your hardware key means an attacker who gains write access to the remote repository cannot forge ledger history without the physical token:
+
+```bash
+hwkey git setup-signing --key ~/.ssh/id_ed25519_sk.pub
+hwkey git log
+```
+
+This configures `gpg.format=ssh`, `commit.gpgsign`, and an allowed-signers file at `~/.hwkey/allowed_signers`. The signer identity and public key are recorded in the encrypted ledger, so other authorized workstations can rebuild the trust list. `hwkey git log` then reports each operation's signature status, and a warning is printed if a pulled ledger tip is unsigned or fails verification.
 
 ---
 
@@ -243,6 +304,8 @@ hwkey ssh web-prod
 ## Ledger Compatibility
 
 Each saved ledger records the hwkey version that last wrote it, the ledger schema version, and the minimum hwkey version required to read it safely. If a future hwkey release updates the ledger in a way that requires newer functionality, older compatible clients will stop with an update-required message instead of silently operating on mismatched state.
+
+**Schema v2** adds the optional `settings` block (PIN cache policy and commit signing). It deliberately does *not* raise `min_hwkey_version`, because the change fails safe in both directions: an older client preserves the unknown keys through a read/write cycle, and — not understanding `pin_cache` — simply prompts for the PIN every time, which is the stricter behaviour. A newer ledger schema produces a warning rather than a hard stop, noting that policies you cannot see may be in force.
 
 Check the installed tool version with:
 

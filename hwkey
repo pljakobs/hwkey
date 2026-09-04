@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 import os
 import sys
+import atexit
 import base64
+import ctypes
+import json
+import shlex
 import struct
+import time
 import yaml
 import tempfile
 import subprocess
@@ -18,8 +23,10 @@ from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2, ClientPin
 from fido2.ctap2.credman import CredentialManagement
 
-HWKEY_VERSION = "0.3.0"
-LEDGER_SCHEMA_VERSION = 1
+HWKEY_VERSION = "0.4.0"
+LEDGER_SCHEMA_VERSION = 2
+# Schema 2 only adds optional settings; unknown keys survive an older client's
+# read/write cycle and its absent PIN cache simply falls back to prompting.
 MIN_LEDGER_HWKEY_VERSION = "0.3.0"
 
 app = typer.Typer(help="Hardware SSH Key Ledger & Remote Manager")
@@ -30,17 +37,28 @@ host_app = typer.Typer(help="Manage target SSH hosts")
 key_app = typer.Typer(help="Manage physical hardware SSH keys")
 sops_app = typer.Typer(help="Manage SOPS & Age encryption recipients")
 git_app = typer.Typer(help="Manage Git remotes and sync settings")
+pin_app = typer.Typer(help="Manage the optional session PIN cache")
 
 # Register sub-applications with the main Typer CLI app
 app.add_typer(host_app, name="host")
 app.add_typer(key_app, name="key")
 app.add_typer(sops_app, name="sops")
 app.add_typer(git_app, name="git")
+app.add_typer(pin_app, name="pin")
 
 REPO_DIR = Path.home() / ".hwkey" / "repo"
 LEDGER_PATH = REPO_DIR / "ledger.enc.yaml"
 
 ENV_PATH = f"{Path.home()}/go/bin:{Path.home()}/.local/bin:{os.environ.get('PATH', '')}"
+
+PIN_KEYRING_SERVICE = "hwkey-fido-pin"
+ALLOWED_SIGNERS_PATH = Path.home() / ".hwkey" / "allowed_signers"
+
+DEFAULT_SETTINGS = {
+    "pin_cache": "off",
+    "pin_cache_ttl_minutes": 10,
+    "commit_signing": False,
+}
 
 def default_ledger() -> dict:
     return {
@@ -49,9 +67,26 @@ def default_ledger() -> dict:
             "min_hwkey_version": MIN_LEDGER_HWKEY_VERSION,
             "last_writer_version": HWKEY_VERSION
         },
+        "settings": dict(DEFAULT_SETTINGS),
         "keys": {},
         "hosts": []
     }
+
+def ledger_settings(ledger: dict) -> dict:
+    settings = ledger.setdefault("settings", {})
+    for name, value in DEFAULT_SETTINGS.items():
+        settings.setdefault(name, value)
+    return settings
+
+def pin_cache_policy(ledger: dict) -> str:
+    """Policy is scoped to this workstation's Age identity, since that is where the PIN would be stored."""
+    settings = ledger_settings(ledger)
+    per_workstation = settings.get("workstation_pin_cache") or {}
+    workstation = get_local_age_pubkey()
+
+    if workstation and per_workstation.get(workstation) in ("off", "session"):
+        return per_workstation[workstation]
+    return settings.get("pin_cache", "off")
 
 def parse_version(version: str) -> Tuple[int, int, int]:
     parts = version.split(".")
@@ -71,8 +106,10 @@ def parse_version(version: str) -> Tuple[int, int, int]:
 
 def ensure_ledger_metadata(data: dict) -> dict:
     metadata = data.setdefault("_hwkey", {})
-    metadata.setdefault("ledger_schema_version", LEDGER_SCHEMA_VERSION)
     metadata.setdefault("min_hwkey_version", MIN_LEDGER_HWKEY_VERSION)
+    metadata["ledger_schema_version"] = max(
+        int(metadata.get("ledger_schema_version", 0)), LEDGER_SCHEMA_VERSION
+    )
     metadata["last_writer_version"] = HWKEY_VERSION
     return data
 
@@ -87,6 +124,13 @@ def check_ledger_compatibility(data: dict):
         )
         console.print(f"[yellow]The ledger was last updated by {last_writer}. Please update hwkey before continuing.[/yellow]")
         raise typer.Exit(1)
+
+    schema_version = int(metadata.get("ledger_schema_version", LEDGER_SCHEMA_VERSION))
+    if schema_version > LEDGER_SCHEMA_VERSION:
+        console.print(
+            f"[bold yellow]Notice: this ledger uses schema v{schema_version}; this hwkey understands v{LEDGER_SCHEMA_VERSION}.[/bold yellow]"
+        )
+        console.print("[yellow]Unknown settings are preserved but ignored. Security policies you cannot see may be in force.[/yellow]")
 
 def host_label(host_info: dict) -> str:
     user = host_info.get("user")
@@ -116,6 +160,103 @@ def bastion_jump_arg(ledger: dict, host_info: dict) -> Optional[str]:
     port = bastion.get("port", 22)
     target = f"{user}@{hostname}" if user else hostname
     return f"{target}:{port}" if port != 22 else target
+
+# ----------------------------------------------------------------------
+# Optional Session PIN Cache
+# ----------------------------------------------------------------------
+
+_STR_DATA_OFFSET = sys.getsizeof("") - 1
+
+def wipe_secret(secret):
+    """Zero a secret's buffer in place; `del` alone leaves the bytes readable in the heap."""
+    if isinstance(secret, bytearray):
+        ctypes.memset((ctypes.c_char * len(secret)).from_buffer(secret), 0, len(secret))
+        return
+
+    # Single-character strings are interned singletons and must never be overwritten.
+    if isinstance(secret, str) and len(secret) > 1:
+        try:
+            ctypes.memset(id(secret) + _STR_DATA_OFFSET, 0, len(secret))
+        except Exception:
+            pass
+
+def _keyring_module():
+    try:
+        import keyring
+    except ImportError:
+        console.print(
+            "[bold red]The 'keyring' package is required for the session PIN cache.[/bold red]\n"
+            "[yellow]Install it with: pip install keyring[/yellow]"
+        )
+        raise typer.Exit(1)
+    return keyring
+
+def store_session_pin(pin: str, ttl_minutes: int):
+    payload = json.dumps({"pin": pin, "expires_at": time.time() + (ttl_minutes * 60)})
+    try:
+        _keyring_module().set_password(PIN_KEYRING_SERVICE, "session", payload)
+    finally:
+        wipe_secret(payload)
+
+def read_session_pin() -> Optional[str]:
+    """Return the cached PIN, dropping it once the session TTL has elapsed."""
+    try:
+        raw = _keyring_module().get_password(PIN_KEYRING_SERVICE, "session")
+    except Exception:
+        return None
+
+    if not raw:
+        return None
+
+    try:
+        entry = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    finally:
+        wipe_secret(raw)
+
+    if time.time() >= entry.get("expires_at", 0):
+        clear_session_pin()
+        wipe_secret(entry.get("pin"))
+        return None
+
+    return entry.get("pin")
+
+def clear_session_pin():
+    try:
+        _keyring_module().delete_password(PIN_KEYRING_SERVICE, "session")
+    except Exception:
+        pass
+
+def session_pin_expiry() -> Optional[float]:
+    try:
+        raw = _keyring_module().get_password(PIN_KEYRING_SERVICE, "session")
+        return json.loads(raw).get("expires_at") if raw else None
+    except Exception:
+        return None
+
+_ASKPASS_DIR = None
+
+def askpass_env(env: dict, ledger: dict) -> dict:
+    """Answer OpenSSH's FIDO PIN prompt from the cache when policy allows it."""
+    if pin_cache_policy(ledger) != "session" or not read_session_pin():
+        return env
+
+    global _ASKPASS_DIR
+    if _ASKPASS_DIR is None:
+        _ASKPASS_DIR = tempfile.TemporaryDirectory(prefix="hwkey-askpass-")
+        atexit.register(_ASKPASS_DIR.cleanup)
+        helper = Path(_ASKPASS_DIR.name) / "askpass"
+        helper.write_text(
+            "#!/bin/sh\n"
+            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} pin askpass \"$@\"\n"
+        )
+        helper.chmod(0o700)
+
+    env = dict(env)
+    env["SSH_ASKPASS"] = str(Path(_ASKPASS_DIR.name) / "askpass")
+    env["SSH_ASKPASS_REQUIRE"] = "force"
+    return env
 
 # ----------------------------------------------------------------------
 # Encrypted Git Ledger Engine
@@ -164,6 +305,26 @@ class GitEncryptedLedger:
                 self._run_cmd(["git", "pull", "--rebase", "--autostash", "origin", "main"])
             except Exception as e:
                 console.print(f"[dim yellow]Notice: Git pull skipped/failed: {e}[/dim yellow]")
+
+            self._warn_on_unverified_head()
+
+    def _warn_on_unverified_head(self):
+        """A signed ledger is only worth anything if unsigned history is surfaced loudly."""
+        if not signing_enabled():
+            return
+
+        res = subprocess.run(
+            ["git", "log", "-1", "--pretty=format:%G?\x1f%GS"],
+            cwd=self.repo_dir, capture_output=True, text=True, env=self._get_env()
+        )
+        status, _, signer = res.stdout.partition("\x1f")
+
+        if status.strip() not in ("G", "U"):
+            label = SIGNATURE_STATUS.get(status.strip(), ("Unknown", ""))[0]
+            console.print(f"[bold red]⚠ Ledger tip commit is not verifiably signed ({label}).[/bold red]")
+            console.print("[yellow]Review it with: hwkey git log[/yellow]")
+        elif signer.strip():
+            console.print(f"[dim green]Ledger tip signed by {signer.strip()}.[/dim green]")
 
     def load(self) -> dict:
         """Decrypts the ledger using SOPS directly into memory."""
@@ -326,12 +487,19 @@ def ensure_yubikey_pin(serial: Optional[str] = None):
                     change_cmd.extend(["--device", serial])
                 change_cmd.extend(["fido", "access", "change-pin"])
 
-                subprocess.run(
-                    change_cmd,
-                    input=f"\n{new_pin}\n{new_pin}\n",
-                    capture_output=True, text=True, check=True,
-                    env=GitEncryptedLedger._get_env()
-                )
+                payload = f"\n{new_pin}\n{new_pin}\n"
+                try:
+                    subprocess.run(
+                        change_cmd,
+                        input=payload,
+                        capture_output=True, text=True, check=True,
+                        env=GitEncryptedLedger._get_env()
+                    )
+                finally:
+                    wipe_secret(payload)
+                    wipe_secret(new_pin)
+                    del payload, new_pin
+
                 console.print("[bold green]✔ FIDO PIN successfully configured.[/bold green]")
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
@@ -387,51 +555,55 @@ def read_attached_resident_keys_via_fido2() -> List[Dict[str, str]]:
     if not devices:
         return discovered_keys
 
-    pin = typer.prompt("Enter FIDO PIN for credential enumeration", hide_input=True)
+    pin = read_session_pin() or typer.prompt("Enter FIDO PIN for credential enumeration", hide_input=True)
 
-    for device_index, device in enumerate(devices, start=1):
-        with device:
-            ctap = Ctap2(device)
-            if not CredentialManagement.is_supported(ctap.info):
-                console.print(f"[dim yellow]Device {device_index} does not support credential management enumeration.[/dim yellow]")
-                continue
-
-            client_pin = ClientPin(ctap)
-            try:
-                pin_token = client_pin.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT)
-            except CtapError as e:
-                if e.code == CtapError.ERR.PIN_NOT_SET:
-                    raise RuntimeError(
-                        "FIDO2 PIN is not set on this hardware key. Other YubiKey PINs "
-                        "(PIV, OpenPGP, OATH/Yubico Authenticator) do not unlock FIDO2 "
-                        "resident SSH credential enumeration. Set it with: ykman fido access change-pin"
-                    ) from e
-                raise
-            credman = CredentialManagement(ctap, client_pin.protocol, pin_token)
-
-            for relying_party in credman.enumerate_rps():
-                rp = relying_party.get(CredentialManagement.RESULT.RP, {})
-                application = rp.get("id", "")
-                if not application.startswith("ssh:"):
+    try:
+        for device_index, device in enumerate(devices, start=1):
+            with device:
+                ctap = Ctap2(device)
+                if not CredentialManagement.is_supported(ctap.info):
+                    console.print(f"[dim yellow]Device {device_index} does not support credential management enumeration.[/dim yellow]")
                     continue
 
-                rp_id_hash = relying_party.get(CredentialManagement.RESULT.RP_ID_HASH)
-                if not rp_id_hash:
-                    continue
+                client_pin = ClientPin(ctap)
+                try:
+                    pin_token = client_pin.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT)
+                except CtapError as e:
+                    if e.code == CtapError.ERR.PIN_NOT_SET:
+                        raise RuntimeError(
+                            "FIDO2 PIN is not set on this hardware key. Other YubiKey PINs "
+                            "(PIV, OpenPGP, OATH/Yubico Authenticator) do not unlock FIDO2 "
+                            "resident SSH credential enumeration. Set it with: ykman fido access change-pin"
+                        ) from e
+                    raise
+                credman = CredentialManagement(ctap, client_pin.protocol, pin_token)
 
-                for credential in credman.enumerate_creds(rp_id_hash):
-                    public_key = credential.get(CredentialManagement.RESULT.PUBLIC_KEY)
-                    pubkey = openssh_sk_ed25519_public_key(public_key, application) if public_key else None
-                    if not pubkey:
+                for relying_party in credman.enumerate_rps():
+                    rp = relying_party.get(CredentialManagement.RESULT.RP, {})
+                    application = rp.get("id", "")
+                    if not application.startswith("ssh:"):
                         continue
 
-                    user = credential.get(CredentialManagement.RESULT.USER, {})
-                    file_name = user.get("name") or user.get("displayName") or f"device_{device_index}_ssh_key"
-                    discovered_keys.append({
-                        "file_name": f"{file_name}.pub",
-                        "public_key": pubkey,
-                        "identity": public_key_identity(pubkey)
-                    })
+                    rp_id_hash = relying_party.get(CredentialManagement.RESULT.RP_ID_HASH)
+                    if not rp_id_hash:
+                        continue
+
+                    for credential in credman.enumerate_creds(rp_id_hash):
+                        public_key = credential.get(CredentialManagement.RESULT.PUBLIC_KEY)
+                        pubkey = openssh_sk_ed25519_public_key(public_key, application) if public_key else None
+                        if not pubkey:
+                            continue
+
+                        user = credential.get(CredentialManagement.RESULT.USER, {})
+                        file_name = user.get("name") or user.get("displayName") or f"device_{device_index}_ssh_key"
+                        discovered_keys.append({
+                            "file_name": f"{file_name}.pub",
+                            "public_key": pubkey,
+                            "identity": public_key_identity(pubkey)
+                        })
+    finally:
+        wipe_secret(pin)
+        del pin
 
     return discovered_keys
 
@@ -498,7 +670,7 @@ def extract_resident_identity_file(key_alias: str, ledger: dict, output_dir: Pat
             ["ssh-keygen", "-K", "-N", ""],
             cwd=output_dir,
             check=True,
-            env=GitEncryptedLedger._get_env()
+            env=askpass_env(GitEncryptedLedger._get_env(), ledger)
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Could not extract resident key stubs from active hardware key: {e}") from e
@@ -543,6 +715,30 @@ def choose_rollout_auth_key(ledger: dict, keys_to_deploy: List[Tuple[str, str]],
 
     return selected
 
+_SSH_CONTROL_DIR: Optional[tempfile.TemporaryDirectory] = None
+
+def ssh_multiplex_options() -> List[str]:
+    """Share one authenticated connection per host so the token is verified once, not per command."""
+    global _SSH_CONTROL_DIR
+    if _SSH_CONTROL_DIR is None:
+        _SSH_CONTROL_DIR = tempfile.TemporaryDirectory(prefix="hwkey-mux-")
+        atexit.register(_SSH_CONTROL_DIR.cleanup)
+
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={Path(_SSH_CONTROL_DIR.name) / '%C'}",
+        "-o", "ControlPersist=60",
+    ]
+
+def close_ssh_master(mux_opts: List[str], target: str, port: int):
+    """Tear down the shared connection so no authenticated socket outlives the operation."""
+    subprocess.run(
+        ["ssh", "-p", str(port)] + mux_opts + ["-O", "exit", target],
+        capture_output=True,
+        text=True,
+        env=GitEncryptedLedger._get_env()
+    )
+
 def update_remote_authorized_keys_via_openssh(
     host_info: dict,
     keys_to_add: List[Tuple[str, str]],
@@ -563,7 +759,12 @@ def update_remote_authorized_keys_via_openssh(
         jump_arg = bastion_jump_arg(ledger, host_info)
         if jump_arg:
             ssh_cmd.extend(["-J", jump_arg])
+
+    mux_opts = ssh_multiplex_options()
+    ssh_cmd.extend(mux_opts)
     ssh_cmd.append(target)
+
+    ssh_env = askpass_env(GitEncryptedLedger._get_env(), ledger) if ledger else GitEncryptedLedger._get_env()
 
     try:
         identity_desc = f" using {identity_file.name}" if identity_file else ""
@@ -573,7 +774,7 @@ def update_remote_authorized_keys_via_openssh(
             stdout=subprocess.PIPE,
             text=True,
             check=True,
-            env=GitEncryptedLedger._get_env()
+            env=ssh_env
         )
 
         retained_lines = []
@@ -599,7 +800,7 @@ def update_remote_authorized_keys_via_openssh(
             input=new_content,
             text=True,
             check=True,
-            env=GitEncryptedLedger._get_env()
+            env=ssh_env
         )
 
         console.print(f"[bold green]✔ Successfully updated keys on {hostname}[/bold green]")
@@ -607,6 +808,8 @@ def update_remote_authorized_keys_via_openssh(
     except Exception as e:
         console.print(f"[bold red]✖ Failed on {hostname}: {e}[/bold red]")
         return False
+    finally:
+        close_ssh_master(mux_opts, target, port)
 
 def update_remote_authorized_keys(
     host_info: dict, 
@@ -888,7 +1091,7 @@ def ssh(
                 capture_output=True,
                 text=True,
                 check=True,
-                env=GitEncryptedLedger._get_env()
+                env=askpass_env(GitEncryptedLedger._get_env(), ledger)
             )
         except subprocess.CalledProcessError:
             console.print("[bold red]Error: Failed to read resident keys from hardware key. Is it attached?[/bold red]")
@@ -925,7 +1128,7 @@ def ssh(
         if command:
             cmd_args.extend(command)
 
-        env = GitEncryptedLedger._get_env()
+        env = askpass_env(GitEncryptedLedger._get_env(), ledger)
         try:
             # FIX ITEM 2: Run subprocess instead of process replacement (execvpe)
             # so the TemporaryDirectory wrapper stays active and cleans up stub files on exit.
@@ -1813,6 +2016,79 @@ def set_git_remote(
 
     console.print(f"[bold green]✔ Git remote 'origin' set to: {git_url}[/bold green]")
 
+def signing_enabled() -> bool:
+    res = subprocess.run(
+        ["git", "config", "--get", "commit.gpgsign"],
+        cwd=REPO_DIR, capture_output=True, text=True, env=GitEncryptedLedger._get_env()
+    )
+    return res.stdout.strip().lower() == "true"
+
+def write_allowed_signers(signers: Dict[str, str]):
+    ALLOWED_SIGNERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{identity} {pubkey.strip()}" for identity, pubkey in sorted(signers.items())]
+    ALLOWED_SIGNERS_PATH.write_text("\n".join(lines) + "\n")
+    ALLOWED_SIGNERS_PATH.chmod(0o600)
+
+@git_app.command("setup-signing")
+def setup_commit_signing(
+    key: Path = typer.Option(Path.home() / ".ssh" / "id_ed25519_sk.pub", "--key", "-k", help="Public SSH key used to sign ledger commits."),
+    email: Optional[str] = typer.Option(None, "--email", "-e", help="Signer identity (defaults to git user.email)."),
+    disable: bool = typer.Option(False, "--disable", help="Turn ledger commit signing back off.")
+):
+    """Sign every ledger commit with a hardware-backed SSH key and record the signer."""
+    if not (REPO_DIR / ".git").exists():
+        console.print("[bold red]No local ledger repository. Run 'hwkey init' first.[/bold red]")
+        raise typer.Exit(1)
+
+    env = GitEncryptedLedger._get_env()
+    ledger = load_ledger()
+    settings = ledger_settings(ledger)
+
+    if disable:
+        for option in ("commit.gpgsign", "tag.gpgsign"):
+            subprocess.run(["git", "config", "--unset", option], cwd=REPO_DIR, capture_output=True, text=True, env=env)
+        settings["commit_signing"] = False
+        save_ledger(ledger, action="Disable ledger commit signing")
+        console.print("[bold yellow]Ledger commit signing disabled.[/bold yellow]")
+        return
+
+    if not key.exists():
+        console.print(f"[bold red]Signing key '{key}' not found.[/bold red]")
+        console.print("[dim]Generate one with: ssh-keygen -t ed25519-sk -O resident -O verify-required -f ~/.ssh/id_ed25519_sk[/dim]")
+        raise typer.Exit(1)
+
+    pubkey = key.read_text().strip()
+    if not pubkey.startswith("sk-"):
+        console.print("[bold yellow]Warning: this key is not hardware-backed (expected an 'sk-' key type).[/bold yellow]")
+        if not typer.confirm("Continue anyway?", default=False):
+            raise typer.Exit(1)
+
+    if not email:
+        res = subprocess.run(["git", "config", "--get", "user.email"], cwd=REPO_DIR, capture_output=True, text=True, env=env)
+        email = res.stdout.strip()
+    if not email:
+        console.print("[bold red]No signer identity available. Pass --email or set git user.email.[/bold red]")
+        raise typer.Exit(1)
+
+    signers = dict(settings.get("allowed_signers", {}))
+    signers[email] = pubkey
+    settings["allowed_signers"] = signers
+    settings["commit_signing"] = True
+    write_allowed_signers(signers)
+
+    for option, value in (
+        ("gpg.format", "ssh"),
+        ("user.signingkey", str(key)),
+        ("commit.gpgsign", "true"),
+        ("tag.gpgsign", "true"),
+        ("gpg.ssh.allowedSignersFile", str(ALLOWED_SIGNERS_PATH)),
+    ):
+        subprocess.run(["git", "config", option, value], cwd=REPO_DIR, check=True, env=env)
+
+    save_ledger(ledger, action=f"Enable ledger commit signing for {email}")
+    console.print(f"[bold green]✔ Ledger commits are now signed as {email}.[/bold green]")
+    console.print(f"[dim]Trusted signers written to {ALLOWED_SIGNERS_PATH}. Verify history with: hwkey git log[/dim]")
+
 @git_app.command("show-remotes")
 def show_git_remotes():
     """Show registered Git remotes configured for the ledger."""
@@ -1900,6 +2176,129 @@ def show_git_log(
 
     console.print(table)
     console.print("[dim]Signatures are only meaningful if gpg.ssh.allowedSignersFile lists the trusted signers.[/dim]")
+
+# ----------------------------------------------------------------------
+# Entity 5: Session PIN Cache Domain (`hwkey pin <cmd>`)
+# ----------------------------------------------------------------------
+
+@pin_app.command("unlock")
+def pin_unlock(
+    ttl: Optional[int] = typer.Option(None, "--ttl", min=1, help="Minutes before the cached PIN expires.")
+):
+    """Cache the FIDO PIN for this session so repeated prompts are skipped."""
+    ledger = load_ledger()
+    settings = ledger_settings(ledger)
+
+    if pin_cache_policy(ledger) != "session":
+        console.print("[bold yellow]PIN caching is not permitted on this workstation.[/bold yellow]")
+        console.print("[dim]Enable it with: hwkey pin policy session[/dim]")
+        raise typer.Exit(1)
+
+    ttl_minutes = ttl or int(settings.get("pin_cache_ttl_minutes", DEFAULT_SETTINGS["pin_cache_ttl_minutes"]))
+    pin = typer.prompt("Enter FIDO PIN to cache for this session", hide_input=True)
+    try:
+        store_session_pin(pin, ttl_minutes)
+    finally:
+        wipe_secret(pin)
+        del pin
+
+    console.print(f"[bold green]✔ PIN cached for {ttl_minutes} minutes.[/bold green]")
+    console.print("[dim yellow]Any process running as your user can read this secret. Run 'hwkey pin lock' when done.[/dim yellow]")
+
+@pin_app.command("lock")
+def pin_lock():
+    """Purge the cached FIDO PIN immediately."""
+    clear_session_pin()
+    console.print("[bold green]✔ Session PIN cache cleared.[/bold green]")
+
+@pin_app.command("status")
+def pin_status():
+    """Show the PIN cache policy per workstation and whether a PIN is currently cached."""
+    ledger = load_ledger()
+    settings = ledger_settings(ledger)
+    local_key = get_local_age_pubkey()
+
+    table = Table(title="PIN Cache Policy")
+    table.add_column("Workstation (Age recipient)", style="cyan")
+    table.add_column("Policy", style="magenta")
+
+    table.add_row("ledger default", str(settings.get("pin_cache", "off")))
+    for workstation, policy in (settings.get("workstation_pin_cache") or {}).items():
+        marker = " *" if workstation == local_key else ""
+        table.add_row(f"{workstation}{marker}", policy)
+
+    console.print(table)
+    console.print(f"[dim]* this workstation. Effective policy here: {pin_cache_policy(ledger)}[/dim]")
+
+    expires_at = session_pin_expiry()
+    if expires_at and expires_at > time.time():
+        remaining = int((expires_at - time.time()) / 60)
+        console.print(f"[bold green]PIN is cached[/bold green] (expires in ~{remaining} min)")
+    else:
+        console.print("[dim]No PIN currently cached.[/dim]")
+
+@pin_app.command("policy")
+def pin_policy(
+    mode: str = typer.Argument(..., help="Either 'off' or 'session'."),
+    workstation: Optional[str] = typer.Option(None, "--workstation", "-w", help="Age recipient key of the workstation to change (defaults to this one)."),
+    ledger_default: bool = typer.Option(False, "--default", help="Set the ledger-wide default for workstations without an explicit policy."),
+    ttl: Optional[int] = typer.Option(None, "--ttl", min=1, help="Default cache lifetime in minutes.")
+):
+    """Set which workstations may cache the FIDO PIN."""
+    if mode not in ("off", "session"):
+        console.print("[bold red]Policy must be either 'off' or 'session'.[/bold red]")
+        raise typer.Exit(1)
+
+    ledger = load_ledger()
+    settings = ledger_settings(ledger)
+
+    if ledger_default:
+        settings["pin_cache"] = mode
+        scope = "ledger default"
+    else:
+        target = workstation or get_local_age_pubkey()
+        if not target:
+            console.print("[bold red]No local Age key found. Run 'hwkey init' or pass --workstation.[/bold red]")
+            raise typer.Exit(1)
+        settings.setdefault("workstation_pin_cache", {})[target] = mode
+        scope = "this workstation" if target == get_local_age_pubkey() else f"workstation {target[:20]}..."
+
+    if ttl:
+        settings["pin_cache_ttl_minutes"] = ttl
+
+    save_ledger(ledger, action=f"Set PIN cache policy '{mode}' for {scope}")
+    console.print(f"[bold green]✔ PIN cache policy for {scope} set to '{mode}'.[/bold green]")
+
+    if mode == "off" and not ledger_default:
+        console.print("[dim]Run 'hwkey pin lock' on that workstation to purge anything already cached.[/dim]")
+
+    if mode == "session":
+        console.print(
+            "[dim yellow]Note: a cached PIN is readable by any process running as your user. "
+            "Signing still requires a physical touch, but credential management does not.[/dim yellow]"
+        )
+
+@pin_app.command("askpass", hidden=True)
+def pin_askpass(prompt: Optional[List[str]] = typer.Argument(None)):
+    """Internal helper invoked by OpenSSH via SSH_ASKPASS."""
+    text = " ".join(prompt or []).lower()
+
+    # Never answer host-key confirmations or password prompts with the FIDO PIN.
+    if "pin" not in text:
+        raise typer.Exit(1)
+
+    pin = read_session_pin()
+    if not pin:
+        raise typer.Exit(1)
+
+    answer = pin + "\n"
+    try:
+        sys.stdout.write(answer)
+        sys.stdout.flush()
+    finally:
+        wipe_secret(answer)
+        wipe_secret(pin)
+        del answer, pin
 
 if __name__ == "__main__":
     app()
