@@ -94,7 +94,7 @@ Shared ledgers (so shared github repos) or simultaneous writes will probably lea
 * **FIDO2 Hardware Key Auto-Discovery:** Direct HID bus scanning to detect connected YubiKeys and discover FIDO2 resident keys (`ssh-ed25519-sk`) without interactive passphrase prompts.
 * **Sub-Application CLI Layout:** Structured domain sub-commands (`host`, `key`, `sops`, `git`) for intuitive administration.
 * **Flexible Host Target Parsing:** Robust user and port resolution via command arguments or `user@hostname` strings.
-* **Seamless SSH Launcher:** `hwkey ssh` extracts non-interactive temporary resident stubs and launches interactive SSH sessions directly.
+* **Seamless SSH Launcher:** `hwkey ssh` uses an `ssh-agent`-held resident credential when available, falling back to temporary key stubs, and launches interactive SSH sessions directly.
 * **Multi-Workstation SOPS Management:** Easily add, list, revoke, or rotate Age recipient keys for multi-workstation access.
 * **Centralized Key Deployment:** Register target hosts once; all enrolled hardware keys are automatically deployed to `authorized_keys`.
 * **Instant Global Revocation:** Revoke lost hardware keys or workstation decryption access with instant Git and server updates.
@@ -179,7 +179,7 @@ hwkey ssh web-prod
 | Command | Description |
 | :--- | :--- |
 | `hwkey init [-g <git_url>]` | Provisions local Age keys, writes `.sops.yaml`, initializes Git repo, and attaches optional remote URL. |
-| `hwkey ssh <target> [-k <key>] [-u <user>] [-p <port>]` | Interactive SSH wrapper that extracts temporary key stubs and logs into `<target>`. |
+| `hwkey ssh <target> [-k <key>] [-u <user>] [-p <port>]` | Interactive SSH wrapper that logs into `<target>`, preferring an `ssh-agent`-held credential over extracting a temporary stub. |
 | `hwkey version` | Shows the local hwkey utility version and supported ledger schema version. |
 
 ### Host Domain (`hwkey host`)
@@ -198,7 +198,7 @@ hwkey ssh web-prod
 | :--- | :--- |
 | `hwkey key scan [-A <auth_key>]` | Scans USB bus for FIDO2 YubiKeys and syncs existing resident keys into the ledger without passphrase prompts. |
 | `hwkey key enroll [-i <id>] [-a <app>] [-A <auth_key>]` | Generates a brand-new resident SSH key (`ed25519-sk`) on the YubiKey, records it, and deploys it using an existing active ledger key. |
-| `hwkey key stub [-o <out_dir>]` | Extracts resident key handles into local persistent SSH stub files (`~/.ssh/id_*_rk`). |
+| `hwkey key stub [-o <out_dir>] [--pub-only]` | Extracts resident key handles into local SSH stub files (`~/.ssh/id_*_rk`). With `--pub-only`, keeps just the public keys and loads the credentials into `ssh-agent`. |
 | `hwkey key verify` | Reads plugged-in resident SSH keys, maps them to ledger aliases, and reports token/deployment status. |
 | `hwkey key resync [-k <key_id>] [-A <auth_key>]` | Repairs incomplete deployments by pushing missing ledger keys to hosts that do not list them as deployed. |
 | `hwkey key add [-A <auth_key>] <key_id> <pubkey>` | Manually adds an SSH public key string to the ledger and deploys it using an existing active ledger key. |
@@ -222,7 +222,7 @@ hwkey ssh web-prod
 | `hwkey git set-remote <git_url>` | Configures or updates the origin remote Git repository URL. |
 | `hwkey git show-remotes` | Displays registered Git remotes configured for the ledger. |
 | `hwkey git log [-n <limit>] [-s]` | Shows the most recent ledger operations, who performed them, and their commit signature status. |
-| `hwkey git setup-signing [-k <pubkey>] [-e <email>] [--disable]` | Signs every ledger commit with a hardware-backed SSH key and records the trusted signer in the ledger. |
+| `hwkey git setup-signing [-k <key>] [-e <email>] [--disable]` | Signs ledger commits with a hardware-backed SSH key, auto-detecting the key if not given, and records every enrolled key as a trusted signer. |
 
 ### Session PIN Cache Domain (`hwkey pin`)
 
@@ -278,11 +278,25 @@ Because the policy lives in the encrypted ledger, revoking caching for a worksta
 Every ledger mutation is a Git commit. Signing them with your hardware key means an attacker who gains write access to the remote repository cannot forge ledger history without the physical token:
 
 ```bash
-hwkey git setup-signing --key ~/.ssh/id_ed25519_sk.pub
+hwkey git setup-signing
 hwkey git log
 ```
 
-This configures `gpg.format=ssh`, `commit.gpgsign`, and an allowed-signers file at `~/.hwkey/allowed_signers`. The signer identity and public key are recorded in the encrypted ledger, so other authorized workstations can rebuild the trust list. `hwkey git log` then reports each operation's signature status, and a warning is printed if a pulled ledger tip is unsigned or fails verification.
+With no `--key`, hwkey looks for hardware-backed (`sk-`) key stubs in `~/.ssh`, offers to extract them from the attached token if none exist, and prefers a key already enrolled in the ledger. `--key` accepts either the stub or its `.pub` sibling.
+
+### Why no private stub is needed
+
+Git signs by calling `ssh-keygen -Y sign -f <key>`. Given a **public** key whose credential is held by `ssh-agent`, it signs through the agent — so hwkey extracts only public keys by default and loads the credentials with `ssh-add -K`. The same applies to `hwkey ssh` and to key rollout: both look for an agent-held credential first and only extract a private stub if none is available.
+
+A resident "private" stub contains no private scalar; it is a credential handle, and the signing key never leaves the secure element. It is therefore not a key-material leak. But it does let anyone holding the token skip the PIN normally required to enumerate credentials, and it advertises how many hardware credentials you own. Keeping only `.pub` files on disk removes both, at the cost of one `ssh-add -K` per session.
+
+Use `hwkey key stub` without `--pub-only` if you prefer persistent stubs that survive agent restarts.
+
+Use `hwkey key stub` without `--pub-only` if you prefer persistent stubs that survive agent restarts.
+
+**Every enrolled hardware key is registered as a trusted signer**, so your backup token can sign too, and any authorized workstation can verify commits made from any other. The signer list and the enabled flag live in the encrypted ledger; because git stores signing settings per repository clone, hwkey re-applies them from the ledger on load and picks whichever trusted key stub is present locally. A second workstation therefore starts signing without being configured by hand — and warns if it holds no trusted key.
+
+If a commit cannot be signed (wrong token plugged in, for example), the operation **fails loudly and exits non-zero** rather than continuing silently, because remote hosts may already have been updated and the ledger would otherwise drift out of sync. A failed *push* is reported separately, since the change is at least recorded locally.
 
 ---
 

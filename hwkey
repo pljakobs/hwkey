@@ -23,7 +23,7 @@ from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2, ClientPin
 from fido2.ctap2.credman import CredentialManagement
 
-HWKEY_VERSION = "0.4.0"
+HWKEY_VERSION = "0.5.0"
 LEDGER_SCHEMA_VERSION = 2
 # Schema 2 only adds optional settings; unknown keys survive an older client's
 # read/write cycle and its absent PIN cache simply falls back to prompting.
@@ -348,6 +348,7 @@ class GitEncryptedLedger:
             data.setdefault("keys", {})
             data.setdefault("hosts", [])
             check_ledger_compatibility(data)
+            apply_signing_config(data)
 
             return data
         except Exception as e:
@@ -389,10 +390,19 @@ class GitEncryptedLedger:
                 self._run_cmd(["git", "add", str(self.ledger_path)])
                 self._run_cmd(["git", "add", ".sops.yaml"])
                 self._run_cmd(["git", "commit", "-m", commit_msg])
+            except Exception as e:
+                console.print(f"[bold red]✖ Ledger change was NOT committed: {e}[/bold red]")
+                console.print("[yellow]Any remote hosts touched by this operation are already updated, so the ledger is now out of sync.[/yellow]")
+                if signing_enabled():
+                    console.print("[yellow]Commit signing is enabled: check that the signing hardware key is plugged in.[/yellow]")
+                raise typer.Exit(1)
+
+            try:
                 self._run_cmd(["git", "push", "origin", "main"])
                 console.print("[dim green]Synced changes with remote Git repo.[/dim green]")
             except Exception as e:
-                console.print(f"[dim yellow]Notice: Git push skipped/failed: {e}[/dim yellow]")
+                console.print(f"[bold yellow]⚠ Committed locally but the push failed: {e}[/bold yellow]")
+                console.print("[yellow]Other workstations will not see this change until it is pushed.[/yellow]")
 
 ledger_mgr = GitEncryptedLedger(REPO_DIR, LEDGER_PATH)
 
@@ -655,6 +665,30 @@ def read_attached_resident_keys() -> List[Dict[str, str]]:
 
     return []
 
+def agent_identity_file(target_identity: Optional[str], scratch: Path) -> Optional[Path]:
+    """Return a public key file the agent can sign for, so no private stub is written to disk."""
+    in_agent = set(agent_key_identities())
+    if not in_agent:
+        return None
+
+    for pub in discover_hardware_public_keys():
+        identity = public_key_identity(pub.read_text())
+        if identity in in_agent and target_identity in (None, identity):
+            return pub
+
+    res = subprocess.run(
+        ["ssh-add", "-L"], capture_output=True, text=True, env=GitEncryptedLedger._get_env()
+    )
+    for line in res.stdout.splitlines():
+        if not line.strip().startswith("sk-"):
+            continue
+        if target_identity in (None, public_key_identity(line)):
+            pub_path = scratch / "agent_identity.pub"
+            pub_path.write_text(line.strip() + "\n")
+            return pub_path
+
+    return None
+
 def extract_resident_identity_file(key_alias: str, ledger: dict, output_dir: Path) -> Path:
     """Extract the resident private-key stub matching a ledger key alias."""
     key_info = ledger.get("keys", {}).get(key_alias)
@@ -664,6 +698,10 @@ def extract_resident_identity_file(key_alias: str, ledger: dict, output_dir: Pat
     target_identity = public_key_identity(key_info.get("public_key", ""))
     if not target_identity:
         raise RuntimeError(f"Key '{key_alias}' has no usable public key in the ledger")
+
+    from_agent = agent_identity_file(target_identity, output_dir)
+    if from_agent:
+        return from_agent
 
     try:
         subprocess.run(
@@ -1084,37 +1122,42 @@ def ssh(
     console.print(f"[bold blue]Connecting to {destination} using YubiKey...[/bold blue]")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            subprocess.run(
-                ["ssh-keygen", "-K", "-N", ""],
-                cwd=tmpdir,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=askpass_env(GitEncryptedLedger._get_env(), ledger)
-            )
-        except subprocess.CalledProcessError:
-            console.print("[bold red]Error: Failed to read resident keys from hardware key. Is it attached?[/bold red]")
-            raise typer.Exit(1)
-
-        pub_files = list(Path(tmpdir).glob("*.pub"))
-        if not pub_files:
-            console.print("[bold red]No resident SSH keys found on attached hardware token.[/bold red]")
-            raise typer.Exit(1)
-
-        identity_file = pub_files[0].with_suffix("")
-
+        target_identity = None
         if key and key in ledger.get("keys", {}):
-            target_pub = ledger["keys"][key]["public_key"].strip()
-            found = False
-            for pub_path in pub_files:
-                with open(pub_path, "r") as f:
-                    if target_pub in f.read().strip():
+            target_identity = public_key_identity(ledger["keys"][key]["public_key"])
+
+        identity_file = agent_identity_file(target_identity, Path(tmpdir))
+
+        if not identity_file:
+            try:
+                subprocess.run(
+                    ["ssh-keygen", "-K", "-N", ""],
+                    cwd=tmpdir,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=askpass_env(GitEncryptedLedger._get_env(), ledger)
+                )
+            except subprocess.CalledProcessError:
+                console.print("[bold red]Error: Failed to read resident keys from hardware key. Is it attached?[/bold red]")
+                raise typer.Exit(1)
+
+            pub_files = list(Path(tmpdir).glob("*.pub"))
+            if not pub_files:
+                console.print("[bold red]No resident SSH keys found on attached hardware token.[/bold red]")
+                raise typer.Exit(1)
+
+            identity_file = pub_files[0].with_suffix("")
+
+            if target_identity:
+                found = False
+                for pub_path in pub_files:
+                    if public_key_identity(pub_path.read_text()) == target_identity:
                         identity_file = pub_path.with_suffix("")
                         found = True
                         break
-            if not found:
-                console.print(f"[bold yellow]Notice: Key '{key}' not found on attached device. Using default resident key.[/bold yellow]")
+                if not found:
+                    console.print(f"[bold yellow]Notice: Key '{key}' not found on attached device. Using default resident key.[/bold yellow]")
 
         cmd_args = ["ssh", "-i", str(identity_file)]
         if resolved_port:
@@ -1434,34 +1477,33 @@ def enroll_key(
 def generate_stubs(
     output_dir: Path = typer.Option(
         Path.home() / ".ssh", "--out-dir", "-o", help="Directory where SSH key stubs should be generated"
+    ),
+    pub_only: bool = typer.Option(
+        False, "--pub-only", help="Keep only public keys on disk and load the credentials into ssh-agent instead."
     )
 ):
     """Extract resident key handles from the attached hardware key into local SSH stubs."""
     console.print(f"[bold blue]Extracting local key handles from attached YubiKey into {output_dir}...[/bold blue]")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        res = subprocess.run(
-            ["ssh-keygen", "-K"],
-            cwd=output_dir,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=GitEncryptedLedger._get_env()
-        )
-
-        extracted_files = list(output_dir.glob("id_*_rk*"))
-        if not extracted_files:
-            console.print("[bold yellow]No resident keys found on the attached token.[/bold yellow]")
-            return
-
-        console.print(f"[bold green]✔ Extracted key stub(s) successfully:[/bold green]")
-        for stub in output_dir.glob("id_*_rk*.pub"):
-            console.print(f"  • {stub.with_suffix('').name} ({stub.name})")
-
+        extracted = extract_resident_stubs(output_dir, pub_only=pub_only)
     except subprocess.CalledProcessError as e:
         console.print(f"[bold red]Failed to extract resident keys: {e.stderr.strip()}[/bold red]")
         raise typer.Exit(1)
+
+    if not extracted:
+        console.print("[bold yellow]No resident keys found on the attached token.[/bold yellow]")
+        return
+
+    console.print("[bold green]✔ Extracted key stub(s) successfully:[/bold green]")
+    for stub in extracted:
+        console.print(f"  • {stub.name}")
+
+    if pub_only:
+        console.print("[dim]No private stubs were written. Load the credentials with: ssh-add -K[/dim]")
+        if typer.confirm("Load them into ssh-agent now?", default=True):
+            if not load_resident_keys_into_agent():
+                console.print("[bold yellow]ssh-add -K failed. Is an agent running?[/bold yellow]")
 
 @key_app.command("scan")
 def scan_keys(
@@ -2023,15 +2065,131 @@ def signing_enabled() -> bool:
     )
     return res.stdout.strip().lower() == "true"
 
-def write_allowed_signers(signers: Dict[str, str]):
+def write_allowed_signers(signers: Dict[str, List[str]]):
     ALLOWED_SIGNERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{identity} {pubkey.strip()}" for identity, pubkey in sorted(signers.items())]
+    lines = []
+    for identity, pubkeys in sorted(signers.items()):
+        for pubkey in pubkeys:
+            lines.append(f"{identity} {pubkey.strip()}")
     ALLOWED_SIGNERS_PATH.write_text("\n".join(lines) + "\n")
     ALLOWED_SIGNERS_PATH.chmod(0o600)
 
+def resolve_public_key_path(key: Path) -> Optional[Path]:
+    """Accept either a resident stub or its .pub sibling; git signs with the public half."""
+    for candidate in (key, Path(f"{key}.pub")):
+        if not candidate.is_file():
+            continue
+        fields = candidate.read_text().strip().split()
+        if len(fields) >= 2 and not fields[0].startswith("-----"):
+            return candidate
+    return None
+
+def discover_hardware_public_keys(search_dir: Path = Path.home() / ".ssh") -> List[Path]:
+    found = []
+    for pub in sorted(search_dir.glob("*.pub")):
+        try:
+            if pub.read_text().strip().startswith("sk-"):
+                found.append(pub)
+        except OSError:
+            continue
+    return found
+
+def extract_resident_stubs(output_dir: Path = Path.home() / ".ssh", pub_only: bool = False) -> List[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not pub_only:
+        subprocess.run(
+            ["ssh-keygen", "-K", "-N", ""],
+            cwd=output_dir, capture_output=True, text=True, check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+        return discover_hardware_public_keys(output_dir)
+
+    # Keep only the public halves; the private stubs never outlive the temp dir.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        subprocess.run(
+            ["ssh-keygen", "-K", "-N", ""],
+            cwd=tmpdir, capture_output=True, text=True, check=True,
+            env=GitEncryptedLedger._get_env()
+        )
+        kept = []
+        for pub in discover_hardware_public_keys(Path(tmpdir)):
+            target = output_dir / pub.name
+            target.write_text(pub.read_text())
+            target.chmod(0o644)
+            kept.append(target)
+        return kept
+
+def agent_key_identities() -> List[str]:
+    res = subprocess.run(
+        ["ssh-add", "-L"], capture_output=True, text=True, env=GitEncryptedLedger._get_env()
+    )
+    if res.returncode != 0:
+        return []
+    return [public_key_identity(line) for line in res.stdout.splitlines() if line.strip()]
+
+def agent_holds_key(pubkey: str) -> bool:
+    return public_key_identity(pubkey) in agent_key_identities()
+
+def load_resident_keys_into_agent() -> bool:
+    """Pull resident credentials straight into the agent, so no private stub is written to disk."""
+    res = subprocess.run(["ssh-add", "-K"], env=GitEncryptedLedger._get_env())
+    return res.returncode == 0
+
+def ledger_alias_for_pubkey(ledger: dict, pubkey: str) -> Optional[str]:
+    identity = public_key_identity(pubkey)
+    for alias, info in ledger.get("keys", {}).items():
+        if public_key_identity(info.get("public_key", "")) == identity:
+            return alias
+    return None
+
+def apply_signing_config(ledger: dict):
+    """Signing settings live in per-workstation git config, so re-apply them from the ledger."""
+    settings = ledger.get("settings") or {}
+    if not settings.get("commit_signing") or not (REPO_DIR / ".git").exists():
+        return
+
+    signers = settings.get("allowed_signers") or {}
+    if signers:
+        write_allowed_signers(signers)
+
+    env = GitEncryptedLedger._get_env()
+
+    def git_config_get(option: str) -> str:
+        return subprocess.run(
+            ["git", "config", "--get", option],
+            cwd=REPO_DIR, capture_output=True, text=True, env=env
+        ).stdout.strip()
+
+    for option, value in (
+        ("gpg.format", "ssh"),
+        ("commit.gpgsign", "true"),
+        ("tag.gpgsign", "true"),
+        ("gpg.ssh.allowedSignersFile", str(ALLOWED_SIGNERS_PATH)),
+    ):
+        if git_config_get(option) != value:
+            subprocess.run(["git", "config", option, value], cwd=REPO_DIR, check=True, env=env)
+
+    signing_key = git_config_get("user.signingkey")
+    if signing_key and Path(signing_key).is_file():
+        return
+
+    candidates = discover_hardware_public_keys()
+    trusted = {public_key_identity(p) for keys in signers.values() for p in keys}
+    in_agent = set(agent_key_identities())
+
+    for candidate in sorted(candidates, key=lambda c: public_key_identity(c.read_text()) not in in_agent):
+        if public_key_identity(candidate.read_text()) in trusted:
+            subprocess.run(["git", "config", "user.signingkey", str(candidate)], cwd=REPO_DIR, check=True, env=env)
+            console.print(f"[dim green]Using {candidate.name} to sign ledger commits on this workstation.[/dim green]")
+            return
+
+    console.print("[bold yellow]⚠ This ledger requires signed commits, but no trusted hardware key stub was found here.[/bold yellow]")
+    console.print("[yellow]Run 'hwkey key stub' then 'hwkey git setup-signing' on this workstation.[/yellow]")
+
 @git_app.command("setup-signing")
 def setup_commit_signing(
-    key: Path = typer.Option(Path.home() / ".ssh" / "id_ed25519_sk.pub", "--key", "-k", help="Public SSH key used to sign ledger commits."),
+    key: Optional[Path] = typer.Option(None, "--key", "-k", help="Signing key to use (defaults to auto-detecting a hardware key)."),
     email: Optional[str] = typer.Option(None, "--email", "-e", help="Signer identity (defaults to git user.email)."),
     disable: bool = typer.Option(False, "--disable", help="Turn ledger commit signing back off.")
 ):
@@ -2052,16 +2210,55 @@ def setup_commit_signing(
         console.print("[bold yellow]Ledger commit signing disabled.[/bold yellow]")
         return
 
-    if not key.exists():
-        console.print(f"[bold red]Signing key '{key}' not found.[/bold red]")
-        console.print("[dim]Generate one with: ssh-keygen -t ed25519-sk -O resident -O verify-required -f ~/.ssh/id_ed25519_sk[/dim]")
-        raise typer.Exit(1)
+    if key:
+        resolved = resolve_public_key_path(key)
+        if not resolved:
+            console.print(f"[bold red]No usable public key found at '{key}' or '{key}.pub'.[/bold red]")
+            raise typer.Exit(1)
+    else:
+        candidates = discover_hardware_public_keys()
+        if not candidates:
+            console.print("[bold yellow]No hardware key stubs found in ~/.ssh.[/bold yellow]")
+            if not typer.confirm("Extract public key stubs from the attached token now?", default=True):
+                raise typer.Exit(1)
+            try:
+                candidates = extract_resident_stubs(pub_only=True)
+            except subprocess.CalledProcessError as e:
+                console.print(f"[bold red]Could not extract resident keys: {e.stderr.strip()}[/bold red]")
+                raise typer.Exit(1)
+            if not candidates:
+                console.print("[bold red]The attached token holds no resident SSH keys.[/bold red]")
+                raise typer.Exit(1)
 
-    pubkey = key.read_text().strip()
+        enrolled = [c for c in candidates if ledger_alias_for_pubkey(ledger, c.read_text())]
+        preferred = enrolled or candidates
+
+        if len(preferred) == 1:
+            resolved = preferred[0]
+        else:
+            console.print("[bold cyan]Multiple hardware keys available:[/bold cyan]")
+            for index, candidate in enumerate(preferred, start=1):
+                alias = ledger_alias_for_pubkey(ledger, candidate.read_text()) or "not in ledger"
+                console.print(f"  {index}. {candidate.name} ({alias})")
+            choice = typer.prompt("Select a signing key", type=int, default=1)
+            if not 1 <= choice <= len(preferred):
+                console.print("[bold red]Invalid selection.[/bold red]")
+                raise typer.Exit(1)
+            resolved = preferred[choice - 1]
+
+    pubkey = resolved.read_text().strip()
     if not pubkey.startswith("sk-"):
         console.print("[bold yellow]Warning: this key is not hardware-backed (expected an 'sk-' key type).[/bold yellow]")
         if not typer.confirm("Continue anyway?", default=False):
             raise typer.Exit(1)
+
+    private_stub = Path(str(resolved)[:-4]) if str(resolved).endswith(".pub") else None
+    if not agent_holds_key(pubkey) and not (private_stub and private_stub.is_file()):
+        console.print("[bold yellow]This key is in neither ssh-agent nor a local private stub, so git cannot sign with it yet.[/bold yellow]")
+        if typer.confirm("Load resident keys into ssh-agent now?", default=True):
+            if not load_resident_keys_into_agent():
+                console.print("[bold red]ssh-add -K failed. Is the token attached and an agent running?[/bold red]")
+                raise typer.Exit(1)
 
     if not email:
         res = subprocess.run(["git", "config", "--get", "user.email"], cwd=REPO_DIR, capture_output=True, text=True, env=env)
@@ -2070,15 +2267,20 @@ def setup_commit_signing(
         console.print("[bold red]No signer identity available. Pass --email or set git user.email.[/bold red]")
         raise typer.Exit(1)
 
-    signers = dict(settings.get("allowed_signers", {}))
-    signers[email] = pubkey
+    # Trust every enrolled hardware key, so any of them can sign from any workstation.
+    signers = {identity: list(keys) for identity, keys in (settings.get("allowed_signers") or {}).items()}
+    trusted = signers.setdefault(email, [])
+    for pub in [pubkey] + [k.get("public_key", "") for k in ledger.get("keys", {}).values()]:
+        if pub.strip().startswith("sk-") and public_key_identity(pub) not in {public_key_identity(t) for t in trusted}:
+            trusted.append(pub.strip())
+
     settings["allowed_signers"] = signers
     settings["commit_signing"] = True
     write_allowed_signers(signers)
 
     for option, value in (
         ("gpg.format", "ssh"),
-        ("user.signingkey", str(key)),
+        ("user.signingkey", str(resolved)),
         ("commit.gpgsign", "true"),
         ("tag.gpgsign", "true"),
         ("gpg.ssh.allowedSignersFile", str(ALLOWED_SIGNERS_PATH)),
@@ -2086,8 +2288,8 @@ def setup_commit_signing(
         subprocess.run(["git", "config", option, value], cwd=REPO_DIR, check=True, env=env)
 
     save_ledger(ledger, action=f"Enable ledger commit signing for {email}")
-    console.print(f"[bold green]✔ Ledger commits are now signed as {email}.[/bold green]")
-    console.print(f"[dim]Trusted signers written to {ALLOWED_SIGNERS_PATH}. Verify history with: hwkey git log[/dim]")
+    console.print(f"[bold green]✔ Ledger commits are now signed as {email} using {resolved.name}.[/bold green]")
+    console.print(f"[dim]{len(trusted)} trusted signer key(s) written to {ALLOWED_SIGNERS_PATH}. Verify with: hwkey git log[/dim]")
 
 @git_app.command("show-remotes")
 def show_git_remotes():
